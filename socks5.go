@@ -22,7 +22,91 @@ const (
 	socks5ReplyGeneralFailure         = 0x01
 	socks5ReplyCommandNotSupported    = 0x07
 	socks5ReplyAddressTypeUnsupported = 0x08
+
+	socks5AuthNone         = 0x00
+	socks5AuthUserPass     = 0x02
+	socks5AuthNoAcceptable = 0xFF
+
+	socks5UserPassVersion = 0x01
+	socks5AuthSuccess     = 0x00
+	socks5AuthFailure     = 0x01
 )
+
+// socks5Handshake performs the version-identification/method-selection and,
+// when username/password are configured, the RFC1929 sub-negotiation.
+//
+// This intentionally does not call gohome/network.Sock5HandshakeBy: that
+// helper writes the authFailure byte on a bad credential but returns a nil
+// error (the write's own err is captured by a shadowing ":=" and never
+// propagated to the named return), so a client that ignores the failure
+// byte and sends a request anyway is served regardless of credentials -
+// a full auth bypass. This local copy returns a real error on mismatch so
+// the caller closes the connection instead of proceeding.
+func socks5ServerAuthHandshake(conn io.ReadWriter, username, password string) error {
+	head := make([]byte, 2)
+	if _, err := io.ReadFull(conn, head); err != nil {
+		return fmt.Errorf("read version/nmethods: %w", err)
+	}
+	if head[0] != socks5Version {
+		return fmt.Errorf("unsupported socks version: %d", head[0])
+	}
+	nmethods := int(head[1])
+	methods := make([]byte, nmethods)
+	if _, err := io.ReadFull(conn, methods); err != nil {
+		return fmt.Errorf("read methods: %w", err)
+	}
+
+	if username == "" && password == "" {
+		if _, err := conn.Write([]byte{socks5Version, socks5AuthNone}); err != nil {
+			return fmt.Errorf("write no-auth reply: %w", err)
+		}
+		return nil
+	}
+
+	hasUserPass := false
+	for _, m := range methods {
+		if m == socks5AuthUserPass {
+			hasUserPass = true
+			break
+		}
+	}
+	if !hasUserPass {
+		conn.Write([]byte{socks5Version, socks5AuthNoAcceptable})
+		return fmt.Errorf("client does not support user/pass auth")
+	}
+	if _, err := conn.Write([]byte{socks5Version, socks5AuthUserPass}); err != nil {
+		return fmt.Errorf("write auth-method reply: %w", err)
+	}
+
+	authHead := make([]byte, 2)
+	if _, err := io.ReadFull(conn, authHead); err != nil {
+		return fmt.Errorf("read auth version/ulen: %w", err)
+	}
+	if authHead[0] != socks5UserPassVersion {
+		return fmt.Errorf("unsupported auth version: %d", authHead[0])
+	}
+	user := make([]byte, authHead[1])
+	if _, err := io.ReadFull(conn, user); err != nil {
+		return fmt.Errorf("read username: %w", err)
+	}
+	plenBuf := make([]byte, 1)
+	if _, err := io.ReadFull(conn, plenBuf); err != nil {
+		return fmt.Errorf("read plen: %w", err)
+	}
+	pass := make([]byte, plenBuf[0])
+	if _, err := io.ReadFull(conn, pass); err != nil {
+		return fmt.Errorf("read password: %w", err)
+	}
+
+	if string(user) != username || string(pass) != password {
+		conn.Write([]byte{socks5UserPassVersion, socks5AuthFailure})
+		return fmt.Errorf("invalid socks5 credentials")
+	}
+	if _, err := conn.Write([]byte{socks5UserPassVersion, socks5AuthSuccess}); err != nil {
+		return fmt.Errorf("write auth-success reply: %w", err)
+	}
+	return nil
+}
 
 type socks5Request struct {
 	Command byte
