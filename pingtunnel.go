@@ -125,7 +125,7 @@ func writeICMP(conn icmp.PacketConn, id int, sequence int, sproto int, server *n
 // KCP's reassembly buffer. In practice it's always the fixed sproto this
 // Client/Server already uses for everything it sends (SEND_PROTO for a
 // client, RECV_PROTO for a server), passed in by the caller.
-func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, recv chan<- *Packet, cryptoConfig *CryptoConfig, fecReceiver *FECReceiver, kcpTransport *KCPTransport, kcpReplySproto int) {
+func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, recv chan<- *Packet, cryptoConfig *CryptoConfig, fecReceiver *FECReceiver, kcpTransport *KCPTransport, kcpReplySproto int, peerModes *PeerModeTracker) {
 
 	defer common.CrashLog()
 
@@ -169,6 +169,9 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, 
 				continue
 			}
 			destKey := fmt.Sprintf("%s|%d", src.String(), echoId)
+			if peerModes != nil {
+				peerModes.Observe(destKey, PeerModeFEC, int(h.DataShards), int(h.ParityShards))
+			}
 			for _, d := range fecReceiver.Feed(destKey, h, content, src, echoId, echoSeq) {
 				deliverPayload(d.mb, cryptoConfig, recv, d.src, d.echoId, d.echoSeq)
 			}
@@ -187,6 +190,9 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, 
 			// very same KCPSession - see KCPTransport's doc comment for
 			// why that's required, not just convenient.
 			destKey := fmt.Sprintf("%s|%d", src.String(), echoId)
+			if peerModes != nil {
+				peerModes.Observe(destKey, PeerModeKCP, 0, 0)
+			}
 			session := kcpTransport.Session(destKey, src, echoId, func(seg []byte) {
 				if err := writeICMP(conn, echoId, 0, kcpReplySproto, src, kcpTransport.BuildPacket(seg)); err != nil {
 					loggo.Error("recvICMP kcp write error %s %s", src.String(), err)
@@ -196,6 +202,9 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, 
 			continue
 		}
 
+		if peerModes != nil {
+			peerModes.Observe(fmt.Sprintf("%s|%d", src.String(), echoId), PeerModeNone, 0, 0)
+		}
 		deliverPayload(payloadData, cryptoConfig, recv, src, echoId, echoSeq)
 	}
 }

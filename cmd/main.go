@@ -105,6 +105,9 @@ Usage:
     -kcp      使用KCP（可靠ARQ传输）代替默认的重传逻辑，默认关闭，不能和-fec同时使用，客户端和服务器需要同时开启
               Use KCP (reliable ARQ transport) instead of the default resend logic. Default off. Cannot be combined with -fec. Client and server must both enable it
 
+              服务器提示：如果服务器既没有-fec也没有-kcp，它会自适应——每个客户端可以自由使用-fec、-kcp或都不用，服务器会自动匹配每个客户端各自的选择（包括同时连接使用不同模式的多个客户端）。仍然想让服务器只接受一种模式吗？照常显式设置-fec或-kcp，行为不变。
+              Server note: if the server has neither -fec nor -kcp, it runs adaptively - each client is free to use -fec, -kcp, or neither, and the server automatically matches whatever that client uses (including multiple simultaneously-connected clients each using a different mode). To pin the server to exactly one mode as before, set -fec or -kcp explicitly as usual - behavior is unchanged in that case
+
     -tcp      设置是否转发tcp，默认0
               Set the switch to forward tcp, the default is 0
 

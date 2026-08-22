@@ -307,3 +307,98 @@ func TestFECReceiverParamMismatchDropsWithoutPanic(t *testing.T) {
 		t.Fatalf("expected mismatched fec params to be dropped, got %d deliverables", len(out))
 	}
 }
+
+// sendAllViaAdaptiveSender drives sender.WrapData for every payload against
+// destKey and returns every framed packet (data shards interleaved with
+// parity, in send order) - the same shape a real sendICMP loop produces.
+func sendAllViaAdaptiveSender(t *testing.T, sender *FECSender, destKey string, payloads [][]byte) [][]byte {
+	t.Helper()
+	var packets [][]byte
+	for _, p := range payloads {
+		framed, parity, ok := sender.WrapData(destKey, p)
+		if !ok {
+			t.Fatalf("WrapData(%s) returned ok=false for payload %q", destKey, p)
+		}
+		packets = append(packets, framed)
+		packets = append(packets, parity...)
+	}
+	return packets
+}
+
+func feedAllToAdaptiveReceiver(receiver *FECReceiver, destKey string, packets [][]byte) [][]byte {
+	var delivered [][]byte
+	for _, pkt := range packets {
+		h, content, err := ParseFECHeader(pkt)
+		if err != nil {
+			continue
+		}
+		for _, d := range receiver.Feed(destKey, h, content, nil, 1, 1) {
+			delivered = append(delivered, d.mb)
+		}
+	}
+	return delivered
+}
+
+// TestAdaptiveFECTwoPeersDifferentParams is the core adaptive-mode
+// guarantee: two destKeys, each using its own (data, parity) shard count
+// the receiver was never preconfigured with, must both decode correctly
+// and independently - matching the "two clients, two different -fec-data/
+// -fec-parity choices, one server with neither flag set" scenario.
+func TestAdaptiveFECTwoPeersDifferentParams(t *testing.T) {
+	receiver := NewAdaptiveFECReceiver()
+
+	send := func(destKey string, dataShards, parityShards int, payloads [][]byte) [][]byte {
+		cfg, err := NewFECConfig(dataShards, parityShards)
+		if err != nil {
+			t.Fatalf("NewFECConfig(%d,%d): %v", dataShards, parityShards, err)
+		}
+		sender := NewFECSender(cfg)
+		return sendAllViaAdaptiveSender(t, sender, destKey, payloads)
+	}
+
+	payloadsA := [][]byte{[]byte("a0"), []byte("a1"), []byte("a2"), []byte("a3")}
+	packetsA := send("peerA", 4, 2, payloadsA)
+
+	payloadsB := [][]byte{[]byte("b0"), []byte("b1"), []byte("b2"), []byte("b3"), []byte("b4"), []byte("b5")}
+	packetsB := send("peerB", 6, 3, payloadsB)
+
+	deliveredA := feedAllToAdaptiveReceiver(receiver, "peerA", packetsA)
+	deliveredB := feedAllToAdaptiveReceiver(receiver, "peerB", packetsB)
+
+	assertMessagesEqual(t, payloadsA, deliveredA)
+	assertMessagesEqual(t, payloadsB, deliveredB)
+}
+
+// TestAdaptiveFECReceiverRejectsOversizedShardCounts guards the
+// resource-exhaustion bound: a header claiming an enormous shard count
+// (which a peer fully controls) must be rejected, not used to allocate an
+// oversized shard buffer.
+func TestAdaptiveFECReceiverRejectsOversizedShardCounts(t *testing.T) {
+	receiver := NewAdaptiveFECReceiver()
+	h := &FECHeader{Group: 0, ShardIndex: 0, DataShards: 200, ParityShards: 200, OrigLen: 5}
+	content, _ := fecShardContent([]byte("hello"))
+
+	out := receiver.Feed("peer", h, content, nil, 1, 1)
+	if len(out) != 0 {
+		t.Fatalf("expected oversized adaptive shard counts to be rejected, got %d deliverables", len(out))
+	}
+}
+
+// TestAdaptiveFECSenderUsesResolvedParams verifies the sender side of
+// adaptive mode: WrapData has no built-in cfg, so it must ask the resolve
+// closure (in production, PeerModeTracker.FECParams) for destKey's params,
+// and must decline (ok=false) rather than guess when resolve reports none.
+func TestAdaptiveFECSenderUsesResolvedParams(t *testing.T) {
+	resolved := map[string][2]int{"peerA": {4, 2}}
+	sender := NewAdaptiveFECSender(func(destKey string) (int, int, bool) {
+		v, ok := resolved[destKey]
+		return v[0], v[1], ok
+	})
+
+	if _, _, ok := sender.WrapData("peerA", []byte("x")); !ok {
+		t.Fatalf("expected WrapData to succeed for a resolvable destKey")
+	}
+	if _, _, ok := sender.WrapData("unknown-peer", []byte("x")); ok {
+		t.Fatalf("expected WrapData to decline (ok=false) for an unresolvable destKey")
+	}
+}

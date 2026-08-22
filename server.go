@@ -1,6 +1,7 @@
 package pingtunnel
 
 import (
+	"fmt"
 	"github.com/esrrhs/gohome/common"
 	"github.com/esrrhs/gohome/loggo"
 	"github.com/esrrhs/gohome/network"
@@ -16,9 +17,28 @@ import (
 func NewServer(icmpAddr string, key int, maxconn int, maxprocessthread int, maxprocessbuffer int, connecttmeout int, cryptoConfig *CryptoConfig, forwardConfig *ForwardConfig, fecConfig *FECConfig, kcpConfig *KCPConfig) (*Server, error) {
 	var fecSender *FECSender
 	var fecReceiver *FECReceiver
-	if fecConfig != nil {
+	var peerModes *PeerModeTracker
+
+	switch {
+	case fecConfig != nil:
+		// Pinned to FEC (-fec was given): every peer must match these
+		// exact shard counts, same as before adaptive mode existed.
 		fecSender = NewFECSender(fecConfig)
 		fecReceiver = NewFECReceiver(fecConfig)
+	case kcpConfig != nil:
+		// Pinned to KCP (-kcp was given): no FEC involvement, unchanged.
+	default:
+		// Neither -fec nor -kcp was given: adaptive mode. Accept and
+		// reply in whichever mode (none/FEC/KCP) each connecting peer's
+		// own traffic uses, tracked per destKey by peerModes - see
+		// PeerModeTracker and (*Server).peerTransport. This is a strict
+		// superset of the old flagless default (plain-only): a peer that
+		// sends plain traffic still gets plain replies.
+		peerModes = NewPeerModeTracker()
+		fecReceiver = NewAdaptiveFECReceiver()
+		fecSender = NewAdaptiveFECSender(peerModes.FECParams)
+		kcpConfig = DefaultKCPConfig()
+		loggo.Info("neither -fec nor -kcp set: running adaptively, matching each client's own reliability mode automatically")
 	}
 
 	s := &Server{
@@ -35,6 +55,7 @@ func NewServer(icmpAddr string, key int, maxconn int, maxprocessthread int, maxp
 		fecSender:        fecSender,
 		fecReceiver:      fecReceiver,
 		kcpConfig:        kcpConfig,
+		peerModes:        peerModes,
 	}
 
 	if maxprocessthread > 0 {
@@ -62,6 +83,9 @@ type Server struct {
 	fecReceiver      *FECReceiver
 	kcpConfig        *KCPConfig
 	kcpTransport     *KCPTransport
+	// peerModes is non-nil only in adaptive mode (neither -fec nor -kcp
+	// pinned this server to a single mode) - see NewServer/peerTransport.
+	peerModes *PeerModeTracker
 
 	icmpAddr string
 
@@ -122,7 +146,7 @@ func (p *Server) Run() error {
 			deliverPayload(msg, p.cryptoConfig, recv, peer, id, 0)
 		})
 	}
-	go recvICMP(&p.workResultLock, &p.exit, *p.conn, recv, p.cryptoConfig, p.fecReceiver, p.kcpTransport, RECV_PROTO)
+	go recvICMP(&p.workResultLock, &p.exit, *p.conn, recv, p.cryptoConfig, p.fecReceiver, p.kcpTransport, RECV_PROTO, p.peerModes)
 
 	go func() {
 		defer common.CrashLog()
@@ -157,6 +181,28 @@ func (p *Server) Run() error {
 	return nil
 }
 
+// peerTransport resolves which reliability layer (if any) to hand to
+// sendICMP for a reply to (src, echoId). In pinned mode (peerModes nil)
+// this is just p.fecSender/p.kcpTransport unconditionally, exactly as
+// before adaptive mode existed. In adaptive mode it looks up what that
+// specific peer's own traffic was last observed using, so a KCP-using
+// client and an FEC-using client connected to the same server at the same
+// time each get replies in their own mode - see PeerModeTracker.
+func (p *Server) peerTransport(src *net.IPAddr, echoId int) (*FECSender, *KCPTransport) {
+	if p.peerModes == nil {
+		return p.fecSender, p.kcpTransport
+	}
+	destKey := fmt.Sprintf("%s|%d", src.String(), echoId)
+	switch p.peerModes.Mode(destKey) {
+	case PeerModeKCP:
+		return nil, p.kcpTransport
+	case PeerModeFEC:
+		return p.fecSender, nil
+	default:
+		return nil, nil
+	}
+}
+
 func (p *Server) Stop() {
 	p.exit = true
 	p.recvcontrol <- 1
@@ -175,10 +221,11 @@ func (p *Server) processPacket(packet *Packet) {
 		t := time.Time{}
 		t.UnmarshalBinary(packet.my.Data)
 		loggo.Info("ping from %s %s %d %d %d", packet.src.String(), t.String(), packet.my.Rproto, packet.echoId, packet.echoSeq)
+		fecSender, kcpTransport := p.peerTransport(packet.src, packet.echoId)
 		sendICMP(packet.echoId, packet.echoSeq, *p.conn, packet.src, "", "", (uint32)(MyMsg_PING), packet.my.Data,
 			(int)(packet.my.Rproto), -1, p.key,
 			0, 0, 0, 0, 0, 0,
-			0, p.cryptoConfig, p.fecSender, p.kcpTransport)
+			0, p.cryptoConfig, fecSender, kcpTransport)
 		return
 	}
 
@@ -336,7 +383,17 @@ func (p *Server) processDataPacket(packet *Packet) {
 
 	if packet.my.Type == (int32)(MyMsg_DATA) {
 
-		if packet.my.Tcpmode > 0 {
+		// localConn.tcpmode (fixed at connection creation in
+		// processDataPacketNewConn), not packet.my.Tcpmode: the two can
+		// disagree for an individual packet (e.g. a stray/retransmitted
+		// packet), and branching on the per-packet field here crashes -
+		// a tcpmode connection never sets localConn.conn (it uses
+		// localConn.fm instead), so a packet.my.Tcpmode of 0 for such a
+		// connection would fall through to localConn.conn.Write on a nil
+		// conn. The connection's own established mode is what actually
+		// determines how its data must be interpreted for its whole
+		// lifetime, regardless of what any single packet's field says.
+		if localConn.tcpmode > 0 {
 			f := &network.Frame{}
 			err := proto.Unmarshal(packet.my.Data, f)
 			if err != nil {
@@ -402,6 +459,7 @@ func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
 	loggo.Info("start wait remote connect tcp %s %s", conn.id, conn.tcpaddrTarget.String())
 	startConnectTime := common.GetNowUpdateInSecond()
 	connectWait := newAdaptiveLoopWait(2*time.Millisecond, 80*time.Millisecond)
+	fecSender, kcpTransport := p.peerTransport(src, conn.echoId)
 	for !p.exit && !conn.exit {
 		if conn.fm.IsConnected() {
 			break
@@ -415,7 +473,7 @@ func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
 			sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, (uint32)(MyMsg_DATA), mb,
 				conn.rproto, -1, p.key, 0,
 				0, 0, 0, 0, 0,
-				0, p.cryptoConfig, p.fecSender, p.kcpTransport)
+				0, p.cryptoConfig, fecSender, kcpTransport)
 			p.sendPacket++
 			p.sendPacketSize += (uint64)(len(mb))
 		}
@@ -517,7 +575,7 @@ mainLoop:
 				sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, (uint32)(MyMsg_DATA), mb,
 					conn.rproto, -1, p.key, 0,
 					0, 0, 0, 0, 0,
-					0, p.cryptoConfig, p.fecSender, p.kcpTransport)
+					0, p.cryptoConfig, fecSender, kcpTransport)
 				p.sendPacket++
 				p.sendPacketSize += (uint64)(len(mb))
 			}
@@ -603,7 +661,7 @@ mainLoop:
 			sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, (uint32)(MyMsg_DATA), mb,
 				conn.rproto, -1, p.key, 0,
 				0, 0, 0, 0, 0,
-				0, p.cryptoConfig, p.fecSender, p.kcpTransport)
+				0, p.cryptoConfig, fecSender, kcpTransport)
 			p.sendPacket++
 			p.sendPacketSize += (uint64)(len(mb))
 		}
@@ -650,6 +708,7 @@ func (p *Server) Recv(conn *ServerConn, id string, src *net.IPAddr) {
 	loggo.Info("server waiting target response %s -> %s %s", conn.udpTargetString(), conn.id, conn.conn.LocalAddr().String())
 
 	bytes := make([]byte, 2000)
+	fecSender, kcpTransport := p.peerTransport(src, conn.echoId)
 
 	for !p.exit {
 
@@ -689,7 +748,7 @@ func (p *Server) Recv(conn *ServerConn, id string, src *net.IPAddr) {
 		sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, targetAddr, id, (uint32)(MyMsg_DATA), payload,
 			conn.rproto, -1, p.key, 0,
 			0, 0, 0, 0, 0,
-			0, p.cryptoConfig, p.fecSender, p.kcpTransport)
+			0, p.cryptoConfig, fecSender, kcpTransport)
 
 		p.sendPacket++
 		p.sendPacketSize += (uint64)(len(payload))
@@ -799,10 +858,11 @@ func (p *Server) deleteServerConn(uuid string) {
 }
 
 func (p *Server) remoteError(echoId int, echoSeq int, uuid string, rprpto int, src *net.IPAddr) {
+	fecSender, kcpTransport := p.peerTransport(src, echoId)
 	sendICMP(echoId, echoSeq, *p.conn, src, "", uuid, (uint32)(MyMsg_KICK), []byte{},
 		rprpto, -1, p.key,
 		0, 0, 0, 0, 0, 0, 0,
-		p.cryptoConfig, p.fecSender, p.kcpTransport)
+		p.cryptoConfig, fecSender, kcpTransport)
 }
 
 func (p *Server) addConnError(addr string) {

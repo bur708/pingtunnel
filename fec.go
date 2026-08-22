@@ -85,6 +85,47 @@ func (f *FECConfig) TotalShards() int {
 	return f.DataShards + f.ParityShards
 }
 
+// maxAdaptiveFECTotalShards bounds how large a (DataShards+ParityShards)
+// pair adaptive mode (see NewAdaptiveFECReceiver/NewAdaptiveFECSender) will
+// honor from a peer-supplied header field, so a peer can't force large
+// per-group memory allocation (TotalShards * fecShardSize() bytes, i.e.
+// ~1KB per shard) just by claiming an enormous shard count. Well above any
+// sane real configuration (defaults are 10/3).
+const maxAdaptiveFECTotalShards = 64
+
+// fecConfigCache lazily builds and reuses *FECConfig instances (each
+// wrapping a reedsolomon.Encoder, which is safe to reuse across many
+// groups/peers) for whatever (dataShards, parityShards) pairs are actually
+// observed in adaptive mode, instead of requiring every peer to share one
+// preconfigured shard count.
+type fecConfigCache struct {
+	mu    sync.Mutex
+	cache map[[2]int]*FECConfig
+}
+
+func newFECConfigCache() *fecConfigCache {
+	return &fecConfigCache{cache: make(map[[2]int]*FECConfig)}
+}
+
+func (c *fecConfigCache) get(dataShards, parityShards int) (*FECConfig, error) {
+	if dataShards <= 0 || parityShards <= 0 || dataShards+parityShards > maxAdaptiveFECTotalShards {
+		return nil, fmt.Errorf("fec: adaptive shard counts out of range: data=%d parity=%d", dataShards, parityShards)
+	}
+	key := [2]int{dataShards, parityShards}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if cfg, ok := c.cache[key]; ok {
+		return cfg, nil
+	}
+	cfg, err := NewFECConfig(dataShards, parityShards)
+	if err != nil {
+		return nil, err
+	}
+	c.cache[key] = cfg
+	return cfg, nil
+}
+
 // EncodeGroup takes exactly f.DataShards payloads (already encrypted frame
 // bytes) belonging to a single group and returns f.TotalShards() wire-ready
 // packets: the DataShards original payloads followed by ParityShards parity
@@ -242,13 +283,25 @@ func fecExtractFrame(content []byte) ([]byte, error) {
 // peer, since parity computed over one peer's packets must never mix with
 // another peer's traffic) and emits the extra parity packets to send once a
 // block of DataShards frames has gone out.
+//
+// In "pinned" mode (cfg set) every destination is encoded with cfg's shard
+// counts, matching the pre-adaptive behavior. In "adaptive" mode (cfg nil,
+// resolve set) each destKey is encoded with whatever shard counts resolve
+// reports for it - see NewAdaptiveFECSender. resolve is how the sender
+// finds out what a given peer's own FEC params are: fec.go has no
+// knowledge of peers or how their params were observed, so this is
+// supplied as a closure (in practice, a PeerModeTracker.FECParams method)
+// rather than fec.go depending on a peer-tracking type directly.
 type FECSender struct {
-	cfg   *FECConfig
-	mu    sync.Mutex
-	state map[string]*fecSendGroup
+	cfg      *FECConfig
+	adaptive *fecConfigCache
+	resolve  func(destKey string) (dataShards, parityShards int, ok bool)
+	mu       sync.Mutex
+	state    map[string]*fecSendGroup
 }
 
 type fecSendGroup struct {
+	cfg    *FECConfig // the config this group's shards are being encoded with
 	group  uint32
 	shards [][]byte // raw (unpadded) payloads collected so far for this group
 	filled int
@@ -259,17 +312,41 @@ func NewFECSender(cfg *FECConfig) *FECSender {
 	return &FECSender{cfg: cfg, state: make(map[string]*fecSendGroup)}
 }
 
+// NewAdaptiveFECSender creates a sender that encodes each destination with
+// whatever FEC params resolve reports for it, instead of one fixed
+// preconfigured shard count. Used by a server that was not pinned to -fec,
+// so a reply to an FEC-using client is encoded with that client's own
+// -fec-data/-fec-parity choice (which resolve looks up from what was last
+// observed on packets received from that same destKey).
+func NewAdaptiveFECSender(resolve func(destKey string) (dataShards, parityShards int, ok bool)) *FECSender {
+	return &FECSender{adaptive: newFECConfigCache(), resolve: resolve, state: make(map[string]*fecSendGroup)}
+}
+
 // WrapData assigns payload the next (group, shardIndex) slot for destKey and
 // returns the FEC-framed packet to send in place of payload. If this call
 // completes a block of DataShards frames, it also returns the parity packets
 // that must be sent right after (their relative order does not matter).
 //
-// If payload is larger than FECMaxPayload, FEC framing is skipped for this
-// one packet (ok is false) and the caller should send payload unprotected,
-// exactly as it would with FEC disabled.
+// If payload is larger than FECMaxPayload, or (in adaptive mode) destKey's
+// FEC params are not yet known, FEC framing is skipped for this one packet
+// (ok is false) and the caller should send payload unprotected, exactly as
+// it would with FEC disabled.
 func (s *FECSender) WrapData(destKey string, payload []byte) (framed []byte, parityPackets [][]byte, ok bool) {
 	if len(payload) > FECMaxPayload {
 		return nil, nil, false
+	}
+
+	cfg := s.cfg
+	if cfg == nil {
+		dataShards, parityShards, found := s.resolve(destKey)
+		if !found {
+			return nil, nil, false
+		}
+		var err error
+		cfg, err = s.adaptive.get(dataShards, parityShards)
+		if err != nil {
+			return nil, nil, false
+		}
 	}
 
 	content, err := fecShardContent(payload)
@@ -281,8 +358,11 @@ func (s *FECSender) WrapData(destKey string, payload []byte) (framed []byte, par
 	defer s.mu.Unlock()
 
 	g, exists := s.state[destKey]
-	if !exists {
-		g = &fecSendGroup{shards: make([][]byte, s.cfg.DataShards)}
+	if !exists || g.cfg != cfg {
+		// Either the first packet ever sent to destKey, or its FEC params
+		// changed since the last one (adaptive mode only) - start a fresh
+		// group rather than mixing shards encoded under two configs.
+		g = &fecSendGroup{cfg: cfg, shards: make([][]byte, cfg.DataShards)}
 		s.state[destKey] = g
 	}
 
@@ -292,16 +372,16 @@ func (s *FECSender) WrapData(destKey string, payload []byte) (framed []byte, par
 	g.shards[idx] = cp
 	g.filled++
 
-	framed = buildFECPacket(g.group, uint8(idx), uint8(s.cfg.DataShards), uint8(s.cfg.ParityShards), uint16(len(payload)), content)
+	framed = buildFECPacket(g.group, uint8(idx), uint8(cfg.DataShards), uint8(cfg.ParityShards), uint16(len(payload)), content)
 
-	if g.filled == s.cfg.DataShards {
-		all, err := s.cfg.EncodeGroup(g.group, g.shards)
+	if g.filled == cfg.DataShards {
+		all, err := cfg.EncodeGroup(g.group, g.shards)
 		if err != nil {
 			loggo.Error("FECSender EncodeGroup error dest %s group %d: %s", destKey, g.group, err)
 		} else {
-			parityPackets = all[s.cfg.DataShards:]
+			parityPackets = all[cfg.DataShards:]
 		}
-		s.state[destKey] = &fecSendGroup{shards: make([][]byte, s.cfg.DataShards), group: g.group + 1}
+		s.state[destKey] = &fecSendGroup{cfg: cfg, shards: make([][]byte, cfg.DataShards), group: g.group + 1}
 	}
 
 	return framed, parityPackets, true
@@ -319,6 +399,7 @@ type fecDeliverable struct {
 }
 
 type fecRecvGroup struct {
+	cfg      *FECConfig // the config this group's shards were encoded with
 	group    uint32
 	shards   [][]byte // len == cfg.TotalShards(); nil entries are missing
 	present  int
@@ -332,16 +413,32 @@ type fecRecvGroup struct {
 // FECReceiver reassembles FEC groups per source peer, delivering data shards
 // as soon as they arrive directly and reconstructing any that were lost
 // (up to ParityShards per group) once enough of the group has been seen.
+//
+// In "pinned" mode (cfg set), every peer must use exactly cfg's shard
+// counts, matching the pre-adaptive behavior. In "adaptive" mode (cfg nil,
+// adaptive set) each group is decoded with whatever (DataShards,
+// ParityShards) its own header claims, via adaptive's cache of
+// lazily-built decoders - see NewAdaptiveFECReceiver.
 type FECReceiver struct {
-	cfg   *FECConfig
-	mu    sync.Mutex
-	state map[string]*fecRecvGroup
+	cfg      *FECConfig
+	adaptive *fecConfigCache
+	mu       sync.Mutex
+	state    map[string]*fecRecvGroup
 }
 
 // NewFECReceiver creates a receiver-side reassembly buffer for the given FEC
 // parameters.
 func NewFECReceiver(cfg *FECConfig) *FECReceiver {
 	return &FECReceiver{cfg: cfg, state: make(map[string]*fecRecvGroup)}
+}
+
+// NewAdaptiveFECReceiver creates a receiver that accepts any FEC parameters
+// a peer presents (within maxAdaptiveFECTotalShards), instead of requiring a
+// single preconfigured shard count. Used by a server that was not pinned to
+// -fec, so each connecting client's own -fec-data/-fec-parity choice is
+// honored automatically rather than having to match a fixed server setting.
+func NewAdaptiveFECReceiver() *FECReceiver {
+	return &FECReceiver{adaptive: newFECConfigCache(), state: make(map[string]*fecRecvGroup)}
 }
 
 // Feed processes one received FEC packet (already header-parsed) for
@@ -351,17 +448,27 @@ func NewFECReceiver(cfg *FECConfig) *FECReceiver {
 // recovered by reconstructing a previous group that destKey has now moved
 // on from.
 //
-// A header whose DataShards/ParityShards do not match the local
-// configuration indicates the peer is using different FEC parameters (or is
-// not running FEC at all and this is a false-positive version byte match);
-// the packet is logged and dropped rather than causing a crash.
+// In pinned mode, a header whose DataShards/ParityShards do not match the
+// local configuration indicates the peer is using different FEC parameters
+// (or is not running FEC at all and this is a false-positive version byte
+// match); the packet is logged and dropped rather than causing a crash. In
+// adaptive mode, only maxAdaptiveFECTotalShards bounds and an in-progress
+// group's own established params are enforced.
 func (r *FECReceiver) Feed(destKey string, h *FECHeader, content []byte, src *net.IPAddr, echoId int, echoSeq int) []fecDeliverable {
-	if int(h.DataShards) != r.cfg.DataShards || int(h.ParityShards) != r.cfg.ParityShards {
+	cfg := r.cfg
+	if cfg == nil {
+		var err error
+		cfg, err = r.adaptive.get(int(h.DataShards), int(h.ParityShards))
+		if err != nil {
+			loggo.Info("FECReceiver: rejecting packet from %s: %s", destKey, err)
+			return nil
+		}
+	} else if int(h.DataShards) != cfg.DataShards || int(h.ParityShards) != cfg.ParityShards {
 		loggo.Info("FECReceiver: fec parameter mismatch from %s (got data=%d parity=%d, want data=%d parity=%d), dropping packet",
-			destKey, h.DataShards, h.ParityShards, r.cfg.DataShards, r.cfg.ParityShards)
+			destKey, h.DataShards, h.ParityShards, cfg.DataShards, cfg.ParityShards)
 		return nil
 	}
-	if int(h.ShardIndex) >= r.cfg.TotalShards() {
+	if int(h.ShardIndex) >= cfg.TotalShards() {
 		loggo.Info("FECReceiver: invalid shard index %d from %s, dropping packet", h.ShardIndex, destKey)
 		return nil
 	}
@@ -372,6 +479,14 @@ func (r *FECReceiver) Feed(destKey string, h *FECHeader, content []byte, src *ne
 	var out []fecDeliverable
 
 	g := r.state[destKey]
+	if g != nil && g.cfg != cfg {
+		// The peer changed FEC params mid-group (or a stale group from
+		// before a restart is still tracked). Finalize/discard whatever
+		// the old group had and start fresh under the new params rather
+		// than mixing shards encoded with two different configs.
+		out = append(out, r.finalizeLocked(g)...)
+		g = nil
+	}
 	if g == nil || h.Group != g.group {
 		if g != nil && h.Group > g.group {
 			out = append(out, r.finalizeLocked(g)...)
@@ -380,9 +495,10 @@ func (r *FECReceiver) Feed(destKey string, h *FECHeader, content []byte, src *ne
 			return nil
 		}
 		g = &fecRecvGroup{
+			cfg:     cfg,
 			group:   h.Group,
-			shards:  make([][]byte, r.cfg.TotalShards()),
-			emitted: make([]bool, r.cfg.DataShards),
+			shards:  make([][]byte, cfg.TotalShards()),
+			emitted: make([]bool, cfg.DataShards),
 		}
 		r.state[destKey] = g
 	}
@@ -399,7 +515,7 @@ func (r *FECReceiver) Feed(destKey string, h *FECHeader, content []byte, src *ne
 	g.shards[idx] = content
 	g.present++
 
-	if idx < r.cfg.DataShards && !g.emitted[idx] {
+	if idx < cfg.DataShards && !g.emitted[idx] {
 		frame, err := fecExtractFrame(content)
 		if err != nil {
 			loggo.Info("FECReceiver: bad shard content from %s group %d shard %d: %s", destKey, h.Group, idx, err)
@@ -409,7 +525,7 @@ func (r *FECReceiver) Feed(destKey string, h *FECHeader, content []byte, src *ne
 		}
 	}
 
-	if g.present == r.cfg.TotalShards() {
+	if g.present == cfg.TotalShards() {
 		delete(r.state, destKey)
 	}
 
@@ -441,7 +557,7 @@ func (r *FECReceiver) FlushStale(staleAfter time.Duration) []fecDeliverable {
 // from r.state itself (callers do that once they decide to move on from g).
 func (r *FECReceiver) finalizeLocked(g *fecRecvGroup) []fecDeliverable {
 	missingData := 0
-	for i := 0; i < r.cfg.DataShards; i++ {
+	for i := 0; i < g.cfg.DataShards; i++ {
 		if !g.emitted[i] {
 			missingData++
 		}
@@ -450,24 +566,24 @@ func (r *FECReceiver) finalizeLocked(g *fecRecvGroup) []fecDeliverable {
 		return nil
 	}
 
-	totalMissing := r.cfg.TotalShards() - g.present
-	if totalMissing > r.cfg.ParityShards {
+	totalMissing := g.cfg.TotalShards() - g.present
+	if totalMissing > g.cfg.ParityShards {
 		loggo.Info("FECReceiver: group %d unrecoverable, lost %d/%d shards (tolerate %d)",
-			g.group, totalMissing, r.cfg.TotalShards(), r.cfg.ParityShards)
+			g.group, totalMissing, g.cfg.TotalShards(), g.cfg.ParityShards)
 		return nil
 	}
 
-	decoded, err := r.cfg.DecodeGroup(g.shards)
+	decoded, err := g.cfg.DecodeGroup(g.shards)
 	if err != nil {
 		loggo.Info("FECReceiver: group %d reconstruction failed: %s", g.group, err)
 		return nil
 	}
 
 	loggo.Info("FECReceiver: group %d recovered %d/%d missing data shard(s) from %d/%d received shards",
-		g.group, missingData, r.cfg.DataShards, g.present, r.cfg.TotalShards())
+		g.group, missingData, g.cfg.DataShards, g.present, g.cfg.TotalShards())
 
 	var out []fecDeliverable
-	for i := 0; i < r.cfg.DataShards; i++ {
+	for i := 0; i < g.cfg.DataShards; i++ {
 		if !g.emitted[i] {
 			out = append(out, fecDeliverable{mb: decoded[i], src: g.src, echoId: g.echoId, echoSeq: g.echoSeq})
 		}

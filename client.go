@@ -335,7 +335,7 @@ func (p *Client) Run() error {
 			deliverPayload(msg, p.cryptoConfig, recv, peer, id, 0)
 		})
 	}
-	go recvICMP(&p.workResultLock, &p.exit, *p.conn, recv, p.cryptoConfig, p.fecReceiver, p.kcpTransport, SEND_PROTO)
+	go recvICMP(&p.workResultLock, &p.exit, *p.conn, recv, p.cryptoConfig, p.fecReceiver, p.kcpTransport, SEND_PROTO, nil)
 
 	go func() {
 		defer common.CrashLog()
