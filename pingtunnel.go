@@ -2,6 +2,7 @@ package pingtunnel
 
 import (
 	"encoding/binary"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -16,7 +17,7 @@ import (
 func sendICMP(id int, sequence int, conn icmp.PacketConn, server *net.IPAddr, target string,
 	connId string, msgType uint32, data []byte, sproto int, rproto int, key int,
 	tcpmode int, tcpmode_buffer_size int, tcpmode_maxwin int, tcpmode_resend_time int, tcpmode_compress int, tcpmode_stat int,
-	timeout int, cryptoConfig *CryptoConfig) {
+	timeout int, cryptoConfig *CryptoConfig, fecSender *FECSender, kcpTransport *KCPTransport) {
 
 	m := &MyMsg{
 		Id:                  connId,
@@ -50,10 +51,55 @@ func sendICMP(id int, sequence int, conn icmp.PacketConn, server *net.IPAddr, ta
 		}
 	}
 
+	// KCP supersedes FEC rather than composing with it (see cmd/main.go's
+	// -kcp/-fec mutual exclusion check): once queued, mb is retransmitted
+	// by the KCP engine itself, and the actual wire packet(s) go out later
+	// from its output callback below, not synchronously from this call -
+	// hence the early return instead of falling through to FEC/writeICMP.
+	// The 0 sequence number is fine here: recvICMP never treats ICMP echo
+	// seq as load-bearing (only echoId is), and a KCP session's own
+	// flushes aren't tied 1:1 to external sendICMP calls anyway.
+	if kcpTransport != nil {
+		destKey := fmt.Sprintf("%s|%d", server.String(), id)
+		session := kcpTransport.Session(destKey, server, id, func(segment []byte) {
+			if err := writeICMP(conn, id, 0, sproto, server, buildKCPPacket(segment)); err != nil {
+				loggo.Error("sendICMP kcp write error %s %s", server.String(), err)
+			}
+		})
+		if err := session.Send(mb); err != nil {
+			loggo.Error("sendICMP kcp send error %s %s", server.String(), err)
+		}
+		return
+	}
+
+	var parityPackets [][]byte
+	if fecSender != nil {
+		framed, parity, ok := fecSender.WrapData(server.String(), mb)
+		if ok {
+			mb = framed
+			parityPackets = parity
+		} else {
+			loggo.Debug("sendICMP fec: payload too large to protect (%d bytes), sending unprotected %s", len(mb), server.String())
+		}
+	}
+
+	if err := writeICMP(conn, id, sequence, sproto, server, mb); err != nil {
+		loggo.Error("sendICMP Marshal error %s %s", server.String(), err)
+		return
+	}
+
+	for _, p := range parityPackets {
+		if err := writeICMP(conn, id, sequence, sproto, server, p); err != nil {
+			loggo.Error("sendICMP fec parity send error %s %s", server.String(), err)
+		}
+	}
+}
+
+func writeICMP(conn icmp.PacketConn, id int, sequence int, sproto int, server *net.IPAddr, data []byte) error {
 	body := &icmp.Echo{
 		ID:   id,
 		Seq:  sequence,
-		Data: mb,
+		Data: data,
 	}
 
 	msg := &icmp.Message{
@@ -64,14 +110,22 @@ func sendICMP(id int, sequence int, conn icmp.PacketConn, server *net.IPAddr, ta
 
 	bytes, err := msg.Marshal(nil)
 	if err != nil {
-		loggo.Error("sendICMP Marshal error %s %s", server.String(), err)
-		return
+		return err
 	}
 
 	conn.WriteTo(bytes, icmpDstAddr(server))
+	return nil
 }
 
-func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, recv chan<- *Packet, cryptoConfig *CryptoConfig) {
+// kcpReplySproto is the ICMP type to use when a KCP session created here
+// (i.e. the peer's first KCP packet arrived before we ever called
+// sendICMP for them) needs to transmit an ACK-only segment. It can't be
+// read off the peer's own MyMsg the way rproto normally would, because at
+// this layer nothing has been decoded yet - the bytes are still inside
+// KCP's reassembly buffer. In practice it's always the fixed sproto this
+// Client/Server already uses for everything it sends (SEND_PROTO for a
+// client, RECV_PROTO for a server), passed in by the caller.
+func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, recv chan<- *Packet, cryptoConfig *CryptoConfig, fecReceiver *FECReceiver, kcpTransport *KCPTransport, kcpReplySproto int) {
 
 	defer common.CrashLog()
 
@@ -82,6 +136,12 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, 
 	for !*exit {
 		conn.SetReadDeadline(time.Now().Add(time.Millisecond * 100))
 		n, srcaddr, err := conn.ReadFrom(bytes)
+
+		if fecReceiver != nil {
+			for _, d := range fecReceiver.FlushStale(FECGroupStaleTimeout) {
+				deliverPayload(d.mb, cryptoConfig, recv, d.src, d.echoId, d.echoSeq)
+			}
+		}
 
 		if err != nil {
 			nerr, ok := err.(net.Error)
@@ -100,32 +160,72 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, 
 
 		// Extract the payload data
 		payloadData := bytes[8:n]
+		src := icmpSrcToIPAddr(srcaddr)
 
-		// Decrypt the data if encryption is enabled
-		if cryptoConfig != nil {
-			payloadData, err = cryptoConfig.Decrypt(payloadData)
+		if fecReceiver != nil && IsFECPacket(payloadData) {
+			h, content, err := ParseFECHeader(payloadData)
 			if err != nil {
-				loggo.Debug("recvICMP Decrypt error: %s", err)
+				loggo.Debug("recvICMP fec header parse error: %s", err)
 				continue
 			}
-		}
-
-		my := &MyMsg{}
-		err = proto.Unmarshal(payloadData, my)
-		if err != nil {
-			loggo.Debug("Unmarshal MyMsg error: %s", err)
+			destKey := fmt.Sprintf("%s|%d", src.String(), echoId)
+			for _, d := range fecReceiver.Feed(destKey, h, content, src, echoId, echoSeq) {
+				deliverPayload(d.mb, cryptoConfig, recv, d.src, d.echoId, d.echoSeq)
+			}
 			continue
 		}
 
-		if my.Magic != (int32)(MyMsg_MAGIC) {
-			loggo.Debug("processPacket data invalid %s", my.Id)
+		if kcpTransport != nil && IsKCPPacket(payloadData) {
+			segment, err := ParseKCPPacket(payloadData)
+			if err != nil {
+				loggo.Debug("recvICMP kcp header parse error: %s", err)
+				continue
+			}
+			// Must match sendICMP's destKey formula exactly (peer address
+			// + the client's own echoId, from either side's point of
+			// view) so both directions of one peer's traffic land on the
+			// very same KCPSession - see KCPTransport's doc comment for
+			// why that's required, not just convenient.
+			destKey := fmt.Sprintf("%s|%d", src.String(), echoId)
+			session := kcpTransport.Session(destKey, src, echoId, func(seg []byte) {
+				if err := writeICMP(conn, echoId, 0, kcpReplySproto, src, buildKCPPacket(seg)); err != nil {
+					loggo.Error("recvICMP kcp write error %s %s", src.String(), err)
+				}
+			})
+			session.Input(segment)
 			continue
 		}
 
-		recv <- &Packet{my: my,
-			src:    icmpSrcToIPAddr(srcaddr),
-			echoId: echoId, echoSeq: echoSeq}
+		deliverPayload(payloadData, cryptoConfig, recv, src, echoId, echoSeq)
 	}
+}
+
+// deliverPayload decrypts (if enabled), unmarshals and enqueues one already
+// FEC-resolved frame. Used both for plain (non-FEC) packets and for frames
+// an FECReceiver produced, whether delivered immediately or reconstructed.
+func deliverPayload(mb []byte, cryptoConfig *CryptoConfig, recv chan<- *Packet, src *net.IPAddr, echoId int, echoSeq int) {
+	if cryptoConfig != nil {
+		var err error
+		mb, err = cryptoConfig.Decrypt(mb)
+		if err != nil {
+			loggo.Debug("recvICMP Decrypt error: %s", err)
+			return
+		}
+	}
+
+	my := &MyMsg{}
+	err := proto.Unmarshal(mb, my)
+	if err != nil {
+		loggo.Debug("Unmarshal MyMsg error: %s", err)
+		return
+	}
+
+	if my.Magic != (int32)(MyMsg_MAGIC) {
+		loggo.Debug("processPacket data invalid %s", my.Id)
+		return
+	}
+
+	recv <- &Packet{my: my, src: src, echoId: echoId, echoSeq: echoSeq}
 }
 
 type Packet struct {

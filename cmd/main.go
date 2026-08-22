@@ -93,6 +93,18 @@ Usage:
     -encrypt-key 加密密钥，支持base64编码或密码短语
               Encryption key, supports base64 encoded key or passphrase
 
+    -fec      开启前向纠错(FEC)，用于在丢包链路（卫星、机场wifi等）上恢复丢失的数据包，默认关闭，客户端和服务器需要使用相同的fec参数
+              Enable forward error correction (FEC) to recover lost packets on lossy links (satellite, airport wifi, etc). Default off. Client and server must use matching FEC parameters
+
+    -fec-data FEC每个数据块的数据分片数，默认10，仅在-fec开启时生效
+              FEC data shards per block, default 10, only used when -fec is enabled
+
+    -fec-parity FEC每个数据块的冗余分片数，默认3，一个数据块最多可以容忍丢失这么多个分片，仅在-fec开启时生效
+              FEC parity shards per block, default 3, tolerates losing up to this many shards per block, only used when -fec is enabled
+
+    -kcp      使用KCP（可靠ARQ传输）代替默认的重传逻辑，默认关闭，不能和-fec同时使用，客户端和服务器需要同时开启
+              Use KCP (reliable ARQ transport) instead of the default resend logic. Default off. Cannot be combined with -fec. Client and server must both enable it
+
     -tcp      设置是否转发tcp，默认0
               Set the switch to forward tcp, the default is 0
 
@@ -152,6 +164,10 @@ func main() {
 	key := flag.Int("key", 0, "key")
 	encryption := flag.String("encrypt", "", "encryption mode: aes128, aes256, chacha20")
 	encryptionKey := flag.String("encrypt-key", "", "encryption key (base64 or passphrase)")
+	fec := flag.Bool("fec", false, "enable forward error correction (FEC) to recover from packet loss on lossy links")
+	fecData := flag.Int("fec-data", 10, "FEC data shards per block (used only when -fec is set)")
+	fecParity := flag.Int("fec-parity", 3, "FEC parity shards per block, tolerates losing up to this many packets per block of fec-data+fec-parity (used only when -fec is set)")
+	kcpFlag := flag.Bool("kcp", false, "use KCP (reliable ARQ) instead of the default resend logic for this tunnel; cannot be combined with -fec")
 	tcpmode := flag.Int("tcp", 0, "tcp mode")
 	tcpmode_buffersize := flag.Int("tcp_bs", 1*1024*1024, "tcp mode buffer size")
 	tcpmode_maxwin := flag.Int("tcp_mw", 20000, "tcp mode max win")
@@ -222,6 +238,34 @@ func main() {
 		}
 	}
 
+	// Create FEC configuration. FEC is fully optional: when -fec is not set,
+	// fecConfig stays nil and the wire format is byte-for-byte identical to
+	// a build without FEC support. The client and server must agree on
+	// -fec-data/-fec-parity themselves; a mismatch (or one side running
+	// without FEC) is only logged and the offending packets are dropped,
+	// never a crash.
+	var fecConfig *pingtunnel.FECConfig
+	if *fec {
+		fecConfig, err = pingtunnel.NewFECConfig(*fecData, *fecParity)
+		if err != nil {
+			fmt.Printf("Failed to create fec config: %v\n", err)
+			return
+		}
+	}
+
+	// KCP is an alternative reliability layer to FEC (a full ARQ engine
+	// instead of block erasure coding); the two are not composed together
+	// in this first integration, so reject the combination up front rather
+	// than silently picking one.
+	var kcpConfig *pingtunnel.KCPConfig
+	if *kcpFlag {
+		if *fec {
+			fmt.Println("-kcp and -fec cannot be used together")
+			return
+		}
+		kcpConfig = pingtunnel.DefaultKCPConfig()
+	}
+
 	level := loggo.LEVEL_INFO
 	if loggo.NameToLevel(*loglevel) >= 0 {
 		level = loggo.NameToLevel(*loglevel)
@@ -235,6 +279,14 @@ func main() {
 	})
 	loggo.Info("start...")
 	loggo.Info("key %d", *key)
+	if fecConfig != nil {
+		loggo.Info("FEC enabled: data=%d parity=%d", fecConfig.DataShards, fecConfig.ParityShards)
+	}
+	if kcpConfig != nil {
+		loggo.Info("KCP enabled: nodelay=%d interval=%dms resend=%d nc=%d sndwnd=%d rcvwnd=%d mtu=%d",
+			kcpConfig.NoDelay, kcpConfig.Interval, kcpConfig.Resend, kcpConfig.NoCongestion,
+			kcpConfig.SndWnd, kcpConfig.RcvWnd, kcpConfig.MTU)
+	}
 
 	if *t == "server" {
 		// Parse forward proxy configuration
@@ -249,7 +301,7 @@ func main() {
 			loggo.Info("Forward proxy configured: %s", *forward)
 		}
 
-		s, err := pingtunnel.NewServer(*icmpListen, *key, *maxconn, *max_process_thread, *max_process_buffer, *conntt, cryptoConfig, forwardConfig)
+		s, err := pingtunnel.NewServer(*icmpListen, *key, *maxconn, *max_process_thread, *max_process_buffer, *conntt, cryptoConfig, forwardConfig, fecConfig, kcpConfig)
 		if err != nil {
 			loggo.Error("ERROR: %s", err.Error())
 			return
@@ -304,7 +356,7 @@ func main() {
 
 		c, err := pingtunnel.NewClient(*listen, *server, *target, *timeout, *key, *icmpListen,
 			*tcpmode, *tcpmode_buffersize, *tcpmode_maxwin, *tcpmode_resend_timems, *tcpmode_compress,
-			*tcpmode_stat, *open_sock5, *maxconn, &filter, cryptoConfig, *sock5_user, *sock5_pass)
+			*tcpmode_stat, *open_sock5, *maxconn, &filter, cryptoConfig, *sock5_user, *sock5_pass, fecConfig, kcpConfig)
 		if err != nil {
 			loggo.Error("ERROR: %s", err.Error())
 			return

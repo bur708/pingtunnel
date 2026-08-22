@@ -1,0 +1,476 @@
+package pingtunnel
+
+import (
+	"encoding/binary"
+	"fmt"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/esrrhs/gohome/loggo"
+	"github.com/klauspost/reedsolomon"
+)
+
+// Wire format of an FEC packet, prepended before the (already encrypted) frame
+// bytes whenever FEC is enabled:
+//
+//	[0]     version/flag byte, always FECVersion for a valid FEC packet
+//	[1:5]   group number, uint32 big-endian
+//	[5]     shard index within the group, uint8
+//	[6]     number of data shards in the group, uint8
+//	[7]     number of parity shards in the group, uint8
+//	[8:10]  original length of this data shard, uint16 big-endian (0 for parity shards)
+//	[10:]   shard payload, zero-padded so every shard in a group is the same length
+const (
+	FECVersion    byte = 1
+	FECHeaderSize      = 10
+)
+
+// FECMaxPayload is the largest already-encrypted frame (mb) that FEC will
+// protect. Every FEC shard, data or parity, is padded to this size (plus a
+// 2-byte embedded length prefix) so that a data shard can be sent the moment
+// it arrives without waiting to see the rest of its group - the padded size
+// has to be fixed up front rather than computed from the group's actual
+// contents. Kept low (well under low-MTU paths like Starlink ~1400,
+// Cloudflare WARP ~1420, or the IPv6 minimum MTU of 1280) so a full FEC
+// packet - 10 header + 2 prefix + FECMaxPayload shard + 8 ICMP + 20 IPv4 =
+// 1040 bytes at 1000 - never gets fragmented and dropped by a strict link,
+// which would defeat the point of adding FEC. Measured worst case for a
+// MyMsg (max-length id/target strings, FRAME_MAX_SIZE data, ChaCha20-
+// Poly1305 overhead) is ~1022 bytes, just over this cap: WrapData falls
+// back to sending such a rare oversized frame unprotected (see its ok
+// return value) rather than protecting it at the cost of fragmentation.
+const FECMaxPayload = 1000
+
+// FECGroupStaleTimeout is how long a receiver waits for more shards of a
+// group before giving up on packets that never showed a reconstructable
+// group (e.g. the tail of a session that stops sending). recvICMP's read
+// loop already wakes up roughly every 100ms, so this is checked on a
+// similar cadence.
+const FECGroupStaleTimeout = 2 * time.Second
+
+// FECConfig holds the Reed-Solomon erasure coding parameters used to protect
+// outgoing frames against packet loss. One group is DataShards data frames
+// plus ParityShards computed parity frames; a group survives the loss of up
+// to ParityShards packets out of DataShards+ParityShards.
+type FECConfig struct {
+	DataShards   int
+	ParityShards int
+	encoder      reedsolomon.Encoder
+}
+
+// NewFECConfig builds an FECConfig for the given shard counts.
+func NewFECConfig(dataShards int, parityShards int) (*FECConfig, error) {
+	if dataShards <= 0 {
+		return nil, fmt.Errorf("fec: dataShards must be > 0, got %d", dataShards)
+	}
+	if parityShards <= 0 {
+		return nil, fmt.Errorf("fec: parityShards must be > 0, got %d", parityShards)
+	}
+
+	enc, err := reedsolomon.New(dataShards, parityShards)
+	if err != nil {
+		return nil, fmt.Errorf("fec: create encoder: %w", err)
+	}
+
+	return &FECConfig{
+		DataShards:   dataShards,
+		ParityShards: parityShards,
+		encoder:      enc,
+	}, nil
+}
+
+// TotalShards returns DataShards+ParityShards.
+func (f *FECConfig) TotalShards() int {
+	return f.DataShards + f.ParityShards
+}
+
+// EncodeGroup takes exactly f.DataShards payloads (already encrypted frame
+// bytes) belonging to a single group and returns f.TotalShards() wire-ready
+// packets: the DataShards original payloads followed by ParityShards parity
+// payloads, each prefixed with the FEC header described above.
+//
+// The original length of each data payload is stored inside the two-byte
+// prefix of the shard's own coded content (not only in the header), so it
+// survives reconstruction on the receive side even when the packet carrying
+// that header was itself lost.
+func (f *FECConfig) EncodeGroup(group uint32, payloads [][]byte) ([][]byte, error) {
+	if len(payloads) != f.DataShards {
+		return nil, fmt.Errorf("fec: EncodeGroup expected %d payloads, got %d", f.DataShards, len(payloads))
+	}
+
+	shards := make([][]byte, f.TotalShards())
+	for i, p := range payloads {
+		s, err := fecShardContent(p)
+		if err != nil {
+			return nil, err
+		}
+		shards[i] = s
+	}
+	for i := f.DataShards; i < f.TotalShards(); i++ {
+		shards[i] = make([]byte, fecShardSize())
+	}
+
+	if err := f.encoder.Encode(shards); err != nil {
+		return nil, fmt.Errorf("fec: encode: %w", err)
+	}
+
+	out := make([][]byte, f.TotalShards())
+	for i, s := range shards {
+		var origLen uint16
+		if i < f.DataShards {
+			origLen = uint16(len(payloads[i]))
+		}
+		out[i] = buildFECPacket(group, uint8(i), uint8(f.DataShards), uint8(f.ParityShards), origLen, s)
+	}
+
+	return out, nil
+}
+
+// DecodeGroup reconstructs the original data payloads of a group given the
+// raw (header-stripped) shard contents. shards must have length
+// f.TotalShards(); missing shards (packets that were lost) must be nil.
+// Returns the f.DataShards original payloads in order.
+func (f *FECConfig) DecodeGroup(shards [][]byte) ([][]byte, error) {
+	if len(shards) != f.TotalShards() {
+		return nil, fmt.Errorf("fec: DecodeGroup expected %d shards, got %d", f.TotalShards(), len(shards))
+	}
+
+	if err := f.encoder.ReconstructData(shards); err != nil {
+		return nil, fmt.Errorf("fec: reconstruct: %w", err)
+	}
+
+	out := make([][]byte, f.DataShards)
+	for i := 0; i < f.DataShards; i++ {
+		s := shards[i]
+		if len(s) < 2 {
+			return nil, fmt.Errorf("fec: reconstructed shard %d too short", i)
+		}
+		origLen := binary.BigEndian.Uint16(s[0:2])
+		if int(origLen)+2 > len(s) {
+			return nil, fmt.Errorf("fec: reconstructed shard %d length %d exceeds shard size", i, origLen)
+		}
+		out[i] = s[2 : 2+int(origLen)]
+	}
+
+	return out, nil
+}
+
+// FECHeader is the parsed form of the per-packet FEC header.
+type FECHeader struct {
+	Group        uint32
+	ShardIndex   uint8
+	DataShards   uint8
+	ParityShards uint8
+	OrigLen      uint16
+}
+
+func buildFECPacket(group uint32, shardIndex uint8, dataShards uint8, parityShards uint8, origLen uint16, shard []byte) []byte {
+	out := make([]byte, FECHeaderSize+len(shard))
+	out[0] = FECVersion
+	binary.BigEndian.PutUint32(out[1:5], group)
+	out[5] = shardIndex
+	out[6] = dataShards
+	out[7] = parityShards
+	binary.BigEndian.PutUint16(out[8:10], origLen)
+	copy(out[FECHeaderSize:], shard)
+	return out
+}
+
+// IsFECPacket reports whether b starts with a valid FEC version byte.
+func IsFECPacket(b []byte) bool {
+	return len(b) >= FECHeaderSize && b[0] == FECVersion
+}
+
+// ParseFECHeader parses the FEC header from a received packet and returns it
+// along with the remaining shard payload (the RS-coded content, still
+// carrying its embedded 2-byte length prefix).
+func ParseFECHeader(b []byte) (*FECHeader, []byte, error) {
+	if len(b) < FECHeaderSize {
+		return nil, nil, fmt.Errorf("fec: packet too short for fec header: %d bytes", len(b))
+	}
+	if b[0] != FECVersion {
+		return nil, nil, fmt.Errorf("fec: unsupported fec version %d", b[0])
+	}
+
+	h := &FECHeader{
+		Group:        binary.BigEndian.Uint32(b[1:5]),
+		ShardIndex:   b[5],
+		DataShards:   b[6],
+		ParityShards: b[7],
+		OrigLen:      binary.BigEndian.Uint16(b[8:10]),
+	}
+
+	return h, b[FECHeaderSize:], nil
+}
+
+// fecShardSize is the fixed length of a shard's RS-coded content (the part
+// after the 10-byte FEC header): a 2-byte embedded length prefix plus
+// FECMaxPayload bytes of (possibly zero-padded) data.
+func fecShardSize() int {
+	return 2 + FECMaxPayload
+}
+
+// fecShardContent builds the fixed-size RS-coded content for a single data
+// shard: a 2-byte big-endian length prefix (so the original length survives
+// even if this shard has to be reconstructed from parity) followed by the
+// payload and zero padding up to fecShardSize().
+func fecShardContent(payload []byte) ([]byte, error) {
+	if len(payload) > FECMaxPayload {
+		return nil, fmt.Errorf("fec: payload too large for fec: %d bytes (max %d)", len(payload), FECMaxPayload)
+	}
+	s := make([]byte, fecShardSize())
+	binary.BigEndian.PutUint16(s[0:2], uint16(len(payload)))
+	copy(s[2:], payload)
+	return s, nil
+}
+
+// fecExtractFrame reverses fecShardContent, reading the embedded length
+// prefix and slicing off the real payload.
+func fecExtractFrame(content []byte) ([]byte, error) {
+	if len(content) < 2 {
+		return nil, fmt.Errorf("fec: shard content too short: %d bytes", len(content))
+	}
+	origLen := binary.BigEndian.Uint16(content[0:2])
+	if int(origLen)+2 > len(content) {
+		return nil, fmt.Errorf("fec: embedded length %d exceeds shard size %d", origLen, len(content))
+	}
+	return content[2 : 2+int(origLen)], nil
+}
+
+// FECSender buffers outgoing frames per destination (one buffer per remote
+// peer, since parity computed over one peer's packets must never mix with
+// another peer's traffic) and emits the extra parity packets to send once a
+// block of DataShards frames has gone out.
+type FECSender struct {
+	cfg   *FECConfig
+	mu    sync.Mutex
+	state map[string]*fecSendGroup
+}
+
+type fecSendGroup struct {
+	group  uint32
+	shards [][]byte // raw (unpadded) payloads collected so far for this group
+	filled int
+}
+
+// NewFECSender creates a sender-side buffer for the given FEC parameters.
+func NewFECSender(cfg *FECConfig) *FECSender {
+	return &FECSender{cfg: cfg, state: make(map[string]*fecSendGroup)}
+}
+
+// WrapData assigns payload the next (group, shardIndex) slot for destKey and
+// returns the FEC-framed packet to send in place of payload. If this call
+// completes a block of DataShards frames, it also returns the parity packets
+// that must be sent right after (their relative order does not matter).
+//
+// If payload is larger than FECMaxPayload, FEC framing is skipped for this
+// one packet (ok is false) and the caller should send payload unprotected,
+// exactly as it would with FEC disabled.
+func (s *FECSender) WrapData(destKey string, payload []byte) (framed []byte, parityPackets [][]byte, ok bool) {
+	if len(payload) > FECMaxPayload {
+		return nil, nil, false
+	}
+
+	content, err := fecShardContent(payload)
+	if err != nil {
+		return nil, nil, false
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	g, exists := s.state[destKey]
+	if !exists {
+		g = &fecSendGroup{shards: make([][]byte, s.cfg.DataShards)}
+		s.state[destKey] = g
+	}
+
+	idx := g.filled
+	cp := make([]byte, len(payload))
+	copy(cp, payload)
+	g.shards[idx] = cp
+	g.filled++
+
+	framed = buildFECPacket(g.group, uint8(idx), uint8(s.cfg.DataShards), uint8(s.cfg.ParityShards), uint16(len(payload)), content)
+
+	if g.filled == s.cfg.DataShards {
+		all, err := s.cfg.EncodeGroup(g.group, g.shards)
+		if err != nil {
+			loggo.Error("FECSender EncodeGroup error dest %s group %d: %s", destKey, g.group, err)
+		} else {
+			parityPackets = all[s.cfg.DataShards:]
+		}
+		s.state[destKey] = &fecSendGroup{shards: make([][]byte, s.cfg.DataShards), group: g.group + 1}
+	}
+
+	return framed, parityPackets, true
+}
+
+// fecDeliverable is a frame recovered by an FECReceiver, tagged with the
+// context (source address, ICMP echo id/seq) it should be delivered with -
+// the same context the original packet would have carried had it not been
+// lost and reconstructed from parity instead.
+type fecDeliverable struct {
+	mb      []byte
+	src     *net.IPAddr
+	echoId  int
+	echoSeq int
+}
+
+type fecRecvGroup struct {
+	group    uint32
+	shards   [][]byte // len == cfg.TotalShards(); nil entries are missing
+	present  int
+	emitted  []bool // len == cfg.DataShards; true once delivered (directly or reconstructed)
+	src      *net.IPAddr
+	echoId   int
+	echoSeq  int
+	lastSeen time.Time
+}
+
+// FECReceiver reassembles FEC groups per source peer, delivering data shards
+// as soon as they arrive directly and reconstructing any that were lost
+// (up to ParityShards per group) once enough of the group has been seen.
+type FECReceiver struct {
+	cfg   *FECConfig
+	mu    sync.Mutex
+	state map[string]*fecRecvGroup
+}
+
+// NewFECReceiver creates a receiver-side reassembly buffer for the given FEC
+// parameters.
+func NewFECReceiver(cfg *FECConfig) *FECReceiver {
+	return &FECReceiver{cfg: cfg, state: make(map[string]*fecRecvGroup)}
+}
+
+// Feed processes one received FEC packet (already header-parsed) for
+// destKey and returns any frames now available for delivery: the frame
+// carried by this packet itself (if it is a data shard, delivered
+// immediately without waiting for the rest of the group), plus any frames
+// recovered by reconstructing a previous group that destKey has now moved
+// on from.
+//
+// A header whose DataShards/ParityShards do not match the local
+// configuration indicates the peer is using different FEC parameters (or is
+// not running FEC at all and this is a false-positive version byte match);
+// the packet is logged and dropped rather than causing a crash.
+func (r *FECReceiver) Feed(destKey string, h *FECHeader, content []byte, src *net.IPAddr, echoId int, echoSeq int) []fecDeliverable {
+	if int(h.DataShards) != r.cfg.DataShards || int(h.ParityShards) != r.cfg.ParityShards {
+		loggo.Info("FECReceiver: fec parameter mismatch from %s (got data=%d parity=%d, want data=%d parity=%d), dropping packet",
+			destKey, h.DataShards, h.ParityShards, r.cfg.DataShards, r.cfg.ParityShards)
+		return nil
+	}
+	if int(h.ShardIndex) >= r.cfg.TotalShards() {
+		loggo.Info("FECReceiver: invalid shard index %d from %s, dropping packet", h.ShardIndex, destKey)
+		return nil
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var out []fecDeliverable
+
+	g := r.state[destKey]
+	if g == nil || h.Group != g.group {
+		if g != nil && h.Group > g.group {
+			out = append(out, r.finalizeLocked(g)...)
+		} else if g != nil && h.Group < g.group {
+			// Stale or duplicate packet for an already-finalized group.
+			return nil
+		}
+		g = &fecRecvGroup{
+			group:   h.Group,
+			shards:  make([][]byte, r.cfg.TotalShards()),
+			emitted: make([]bool, r.cfg.DataShards),
+		}
+		r.state[destKey] = g
+	}
+
+	idx := int(h.ShardIndex)
+	g.src = src
+	g.echoId = echoId
+	g.echoSeq = echoSeq
+	g.lastSeen = time.Now()
+
+	if g.shards[idx] != nil {
+		return out // duplicate packet, ignore
+	}
+	g.shards[idx] = content
+	g.present++
+
+	if idx < r.cfg.DataShards && !g.emitted[idx] {
+		frame, err := fecExtractFrame(content)
+		if err != nil {
+			loggo.Info("FECReceiver: bad shard content from %s group %d shard %d: %s", destKey, h.Group, idx, err)
+		} else {
+			g.emitted[idx] = true
+			out = append(out, fecDeliverable{mb: frame, src: src, echoId: echoId, echoSeq: echoSeq})
+		}
+	}
+
+	if g.present == r.cfg.TotalShards() {
+		delete(r.state, destKey)
+	}
+
+	return out
+}
+
+// FlushStale finalizes (attempting reconstruction, then discarding) any
+// tracked group that has not seen a new shard in at least staleAfter. Call
+// this periodically so the tail of a session - fewer than DataShards frames
+// followed by silence - is not held forever waiting for a group that will
+// never fill.
+func (r *FECReceiver) FlushStale(staleAfter time.Duration) []fecDeliverable {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var out []fecDeliverable
+	now := time.Now()
+	for key, g := range r.state {
+		if now.Sub(g.lastSeen) >= staleAfter {
+			out = append(out, r.finalizeLocked(g)...)
+			delete(r.state, key)
+		}
+	}
+	return out
+}
+
+// finalizeLocked attempts to reconstruct any data shards of g that were
+// never received directly. Must be called with r.mu held; does not remove g
+// from r.state itself (callers do that once they decide to move on from g).
+func (r *FECReceiver) finalizeLocked(g *fecRecvGroup) []fecDeliverable {
+	missingData := 0
+	for i := 0; i < r.cfg.DataShards; i++ {
+		if !g.emitted[i] {
+			missingData++
+		}
+	}
+	if missingData == 0 {
+		return nil
+	}
+
+	totalMissing := r.cfg.TotalShards() - g.present
+	if totalMissing > r.cfg.ParityShards {
+		loggo.Info("FECReceiver: group %d unrecoverable, lost %d/%d shards (tolerate %d)",
+			g.group, totalMissing, r.cfg.TotalShards(), r.cfg.ParityShards)
+		return nil
+	}
+
+	decoded, err := r.cfg.DecodeGroup(g.shards)
+	if err != nil {
+		loggo.Info("FECReceiver: group %d reconstruction failed: %s", g.group, err)
+		return nil
+	}
+
+	loggo.Info("FECReceiver: group %d recovered %d/%d missing data shard(s) from %d/%d received shards",
+		g.group, missingData, r.cfg.DataShards, g.present, r.cfg.TotalShards())
+
+	var out []fecDeliverable
+	for i := 0; i < r.cfg.DataShards; i++ {
+		if !g.emitted[i] {
+			out = append(out, fecDeliverable{mb: decoded[i], src: g.src, echoId: g.echoId, echoSeq: g.echoSeq})
+		}
+	}
+	return out
+}

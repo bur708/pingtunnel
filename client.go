@@ -24,7 +24,7 @@ const (
 func NewClient(addr string, server string, target string, timeout int, key int, icmpAddr string,
 	tcpmode int, tcpmode_buffersize int, tcpmode_maxwin int, tcpmode_resend_timems int, tcpmode_compress int,
 	tcpmode_stat int, open_sock5 int, maxconn int, sock5_filter *func(addr string) bool, cryptoConfig *CryptoConfig,
-	sock5_user string, sock5_pass string) (*Client, error) {
+	sock5_user string, sock5_pass string, fecConfig *FECConfig, kcpConfig *KCPConfig) (*Client, error) {
 
 	var ipaddr *net.UDPAddr
 	var tcpaddr *net.TCPAddr
@@ -45,6 +45,13 @@ func NewClient(addr string, server string, target string, timeout int, key int, 
 	ipaddrServer, err := net.ResolveIPAddr("ip", server)
 	if err != nil {
 		return nil, err
+	}
+
+	var fecSender *FECSender
+	var fecReceiver *FECReceiver
+	if fecConfig != nil {
+		fecSender = NewFECSender(fecConfig)
+		fecReceiver = NewFECReceiver(fecConfig)
 	}
 
 	rand.Seed(time.Now().UnixNano())
@@ -75,6 +82,10 @@ func NewClient(addr string, server string, target string, timeout int, key int, 
 		sock5_user:            sock5_user,
 		sock5_pass:            sock5_pass,
 		cryptoConfig:          cryptoConfig,
+		fecConfig:             fecConfig,
+		fecSender:             fecSender,
+		fecReceiver:           fecReceiver,
+		kcpConfig:             kcpConfig,
 		nextResolveAt:         now,
 		resolveRetryBackoff:   2 * time.Second,
 	}
@@ -107,6 +118,11 @@ type Client struct {
 	sock5_user   string
 	sock5_pass   string
 	cryptoConfig *CryptoConfig
+	fecConfig    *FECConfig
+	fecSender    *FECSender
+	fecReceiver  *FECReceiver
+	kcpConfig    *KCPConfig
+	kcpTransport *KCPTransport
 
 	ipaddr  *net.UDPAddr
 	tcpaddr *net.TCPAddr
@@ -310,7 +326,15 @@ func (p *Client) Run() error {
 
 	recv := make(chan *Packet, 10000)
 	p.recvcontrol = make(chan int, 1)
-	go recvICMP(&p.workResultLock, &p.exit, *p.conn, recv, p.cryptoConfig)
+	// Built here rather than in NewClient because its deliver callback
+	// needs recv, which doesn't exist until now - same reason p.conn
+	// itself is only set inside Run(), not the constructor.
+	if p.kcpConfig != nil {
+		p.kcpTransport = NewKCPTransport(p.kcpConfig, func(msg []byte, peer *net.IPAddr, id int) {
+			deliverPayload(msg, p.cryptoConfig, recv, peer, id, 0)
+		})
+	}
+	go recvICMP(&p.workResultLock, &p.exit, *p.conn, recv, p.cryptoConfig, p.fecReceiver, p.kcpTransport, SEND_PROTO)
 
 	go func() {
 		defer common.CrashLog()
@@ -444,7 +468,7 @@ func (p *Client) AcceptTcpConn(conn *net.TCPConn, targetAddr string) {
 			sendICMP(p.id, p.sequence, *p.conn, p.ipaddrServer, targetAddr, clientConn.id, (uint32)(MyMsg_DATA), mb,
 				SEND_PROTO, RECV_PROTO, p.key,
 				p.tcpmode, p.tcpmode_buffersize, p.tcpmode_maxwin, p.tcpmode_resend_timems, p.tcpmode_compress, p.tcpmode_stat,
-				p.timeout, p.cryptoConfig)
+				p.timeout, p.cryptoConfig, p.fecSender, p.kcpTransport)
 			p.sendPacket++
 			p.sendPacketSize += (uint64)(len(mb))
 		}
@@ -547,7 +571,7 @@ mainLoop:
 				sendICMP(p.id, p.sequence, *p.conn, p.ipaddrServer, targetAddr, clientConn.id, (uint32)(MyMsg_DATA), mb,
 					SEND_PROTO, RECV_PROTO, p.key,
 					p.tcpmode, 0, 0, 0, 0, 0,
-					0, p.cryptoConfig)
+					0, p.cryptoConfig, p.fecSender, p.kcpTransport)
 				p.sendPacket++
 				p.sendPacketSize += (uint64)(len(mb))
 			}
@@ -636,7 +660,7 @@ mainLoop:
 			sendICMP(p.id, p.sequence, *p.conn, p.ipaddrServer, targetAddr, clientConn.id, (uint32)(MyMsg_DATA), mb,
 				SEND_PROTO, RECV_PROTO, p.key,
 				p.tcpmode, 0, 0, 0, 0, 0,
-				0, p.cryptoConfig)
+				0, p.cryptoConfig, p.fecSender, p.kcpTransport)
 			p.sendPacket++
 			p.sendPacketSize += (uint64)(len(mb))
 		}
@@ -714,7 +738,7 @@ func (p *Client) Accept() error {
 		sendICMP(p.id, p.sequence, *p.conn, p.ipaddrServer, p.targetAddr, clientConn.id, (uint32)(MyMsg_DATA), bytes[:n],
 			SEND_PROTO, RECV_PROTO, p.key,
 			clientConn.tcpmode, 0, 0, 0, 0, 0,
-			p.timeout, p.cryptoConfig)
+			p.timeout, p.cryptoConfig, p.fecSender, p.kcpTransport)
 
 		p.sequence++
 
@@ -872,7 +896,7 @@ func (p *Client) ping() {
 	sendICMP(p.id, p.sequence, *p.conn, p.ipaddrServer, "", "", (uint32)(MyMsg_PING), b,
 		SEND_PROTO, RECV_PROTO, p.key,
 		0, 0, 0, 0, 0, 0,
-		0, p.cryptoConfig)
+		0, p.cryptoConfig, p.fecSender, p.kcpTransport)
 	loggo.Info("ping %s %s %d %d %d %d", p.addrServer, now.String(), p.sproto, p.rproto, p.id, p.sequence)
 	p.sequence++
 	if now.Sub(p.pongTime) > time.Second*3 {
@@ -1083,7 +1107,7 @@ func (p *Client) recvSock5UDP(relayConn *net.UDPConn, expectedIP net.IP, expecte
 		sendICMP(p.id, p.sequence, *p.conn, p.ipaddrServer, targetAddr, clientConn.id, (uint32)(MyMsg_DATA), payload,
 			SEND_PROTO, RECV_PROTO, p.key,
 			0, 0, 0, 0, 0, 0,
-			p.timeout, p.cryptoConfig)
+			p.timeout, p.cryptoConfig, p.fecSender, p.kcpTransport)
 
 		p.sequence++
 		p.sendPacket++
@@ -1183,7 +1207,7 @@ func (p *Client) remoteError(uuid string) {
 	sendICMP(p.id, p.sequence, *p.conn, p.ipaddrServer, "", uuid, (uint32)(MyMsg_KICK), []byte{},
 		SEND_PROTO, RECV_PROTO, p.key,
 		0, 0, 0, 0, 0, 0,
-		0, p.cryptoConfig)
+		0, p.cryptoConfig, p.fecSender, p.kcpTransport)
 }
 
 func (p *Client) AcceptDirectTcpConn(conn *net.TCPConn, targetAddr string) {

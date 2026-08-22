@@ -13,7 +13,14 @@ import (
 	"time"
 )
 
-func NewServer(icmpAddr string, key int, maxconn int, maxprocessthread int, maxprocessbuffer int, connecttmeout int, cryptoConfig *CryptoConfig, forwardConfig *ForwardConfig) (*Server, error) {
+func NewServer(icmpAddr string, key int, maxconn int, maxprocessthread int, maxprocessbuffer int, connecttmeout int, cryptoConfig *CryptoConfig, forwardConfig *ForwardConfig, fecConfig *FECConfig, kcpConfig *KCPConfig) (*Server, error) {
+	var fecSender *FECSender
+	var fecReceiver *FECReceiver
+	if fecConfig != nil {
+		fecSender = NewFECSender(fecConfig)
+		fecReceiver = NewFECReceiver(fecConfig)
+	}
+
 	s := &Server{
 		icmpAddr:         icmpAddr,
 		exit:             false,
@@ -24,6 +31,10 @@ func NewServer(icmpAddr string, key int, maxconn int, maxprocessthread int, maxp
 		connecttmeout:    connecttmeout,
 		cryptoConfig:     cryptoConfig,
 		forwardConfig:    forwardConfig,
+		fecConfig:        fecConfig,
+		fecSender:        fecSender,
+		fecReceiver:      fecReceiver,
+		kcpConfig:        kcpConfig,
 	}
 
 	if maxprocessthread > 0 {
@@ -46,6 +57,11 @@ type Server struct {
 	connecttmeout    int
 	cryptoConfig     *CryptoConfig
 	forwardConfig    *ForwardConfig
+	fecConfig        *FECConfig
+	fecSender        *FECSender
+	fecReceiver      *FECReceiver
+	kcpConfig        *KCPConfig
+	kcpTransport     *KCPTransport
 
 	icmpAddr string
 
@@ -97,7 +113,15 @@ func (p *Server) Run() error {
 
 	recv := make(chan *Packet, 10000)
 	p.recvcontrol = make(chan int, 1)
-	go recvICMP(&p.workResultLock, &p.exit, *p.conn, recv, p.cryptoConfig)
+	// Built here rather than in NewServer because its deliver callback
+	// needs recv, which doesn't exist until now - same reason p.conn
+	// itself is only set inside Run(), not the constructor.
+	if p.kcpConfig != nil {
+		p.kcpTransport = NewKCPTransport(p.kcpConfig, func(msg []byte, peer *net.IPAddr, id int) {
+			deliverPayload(msg, p.cryptoConfig, recv, peer, id, 0)
+		})
+	}
+	go recvICMP(&p.workResultLock, &p.exit, *p.conn, recv, p.cryptoConfig, p.fecReceiver, p.kcpTransport, RECV_PROTO)
 
 	go func() {
 		defer common.CrashLog()
@@ -153,7 +177,7 @@ func (p *Server) processPacket(packet *Packet) {
 		sendICMP(packet.echoId, packet.echoSeq, *p.conn, packet.src, "", "", (uint32)(MyMsg_PING), packet.my.Data,
 			(int)(packet.my.Rproto), -1, p.key,
 			0, 0, 0, 0, 0, 0,
-			0, p.cryptoConfig)
+			0, p.cryptoConfig, p.fecSender, p.kcpTransport)
 		return
 	}
 
@@ -390,7 +414,7 @@ func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
 			sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, (uint32)(MyMsg_DATA), mb,
 				conn.rproto, -1, p.key, 0,
 				0, 0, 0, 0, 0,
-				0, p.cryptoConfig)
+				0, p.cryptoConfig, p.fecSender, p.kcpTransport)
 			p.sendPacket++
 			p.sendPacketSize += (uint64)(len(mb))
 		}
@@ -492,7 +516,7 @@ mainLoop:
 				sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, (uint32)(MyMsg_DATA), mb,
 					conn.rproto, -1, p.key, 0,
 					0, 0, 0, 0, 0,
-					0, p.cryptoConfig)
+					0, p.cryptoConfig, p.fecSender, p.kcpTransport)
 				p.sendPacket++
 				p.sendPacketSize += (uint64)(len(mb))
 			}
@@ -578,7 +602,7 @@ mainLoop:
 			sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, (uint32)(MyMsg_DATA), mb,
 				conn.rproto, -1, p.key, 0,
 				0, 0, 0, 0, 0,
-				0, p.cryptoConfig)
+				0, p.cryptoConfig, p.fecSender, p.kcpTransport)
 			p.sendPacket++
 			p.sendPacketSize += (uint64)(len(mb))
 		}
@@ -664,7 +688,7 @@ func (p *Server) Recv(conn *ServerConn, id string, src *net.IPAddr) {
 		sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, targetAddr, id, (uint32)(MyMsg_DATA), payload,
 			conn.rproto, -1, p.key, 0,
 			0, 0, 0, 0, 0,
-			0, p.cryptoConfig)
+			0, p.cryptoConfig, p.fecSender, p.kcpTransport)
 
 		p.sendPacket++
 		p.sendPacketSize += (uint64)(len(payload))
@@ -777,7 +801,7 @@ func (p *Server) remoteError(echoId int, echoSeq int, uuid string, rprpto int, s
 	sendICMP(echoId, echoSeq, *p.conn, src, "", uuid, (uint32)(MyMsg_KICK), []byte{},
 		rprpto, -1, p.key,
 		0, 0, 0, 0, 0, 0, 0,
-		p.cryptoConfig)
+		p.cryptoConfig, p.fecSender, p.kcpTransport)
 }
 
 func (p *Server) addConnError(addr string) {
