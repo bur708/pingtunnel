@@ -1,15 +1,53 @@
 package pingtunnel
 
 import (
+	"strings"
 	"testing"
 )
 
+// Regression test for CRLF/HTTP request injection: a tunneled target
+// address containing CR/LF must never reach httpConnectHandshake's raw
+// "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n" formatting.
+func TestValidateProxyTargetAddrRejectsControlChars(t *testing.T) {
+	bad := []string{
+		"evil.com:80\r\nX-Injected: 1",
+		"evil.com:80\r\n\r\nGET /admin HTTP/1.1",
+		"evil.com:80\n",
+		"evil.com:80\x00",
+	}
+	for _, addr := range bad {
+		if err := validateProxyTargetAddr(addr); err == nil {
+			t.Errorf("expected error for %q, got nil", addr)
+		}
+	}
+}
+
+func TestValidateProxyTargetAddrAllowsNormalAddresses(t *testing.T) {
+	good := []string{"example.com:443", "192.168.1.1:80", "[::1]:8080"}
+	for _, addr := range good {
+		if err := validateProxyTargetAddr(addr); err != nil {
+			t.Errorf("unexpected error for %q: %v", addr, err)
+		}
+	}
+}
+
+func TestDialThroughProxyRejectsInjectedTargetBeforeDialing(t *testing.T) {
+	config := &ForwardConfig{Scheme: "http", Host: "127.0.0.1", Port: 1}
+	_, err := DialThroughProxy(config, "evil.com\r\nX-Injected: 1", 0)
+	if err == nil {
+		t.Fatal("expected error for CRLF-injected target address")
+	}
+	if !strings.Contains(err.Error(), "control character") {
+		t.Fatalf("expected control-character error, got: %v", err)
+	}
+}
+
 func TestParseForwardURL(t *testing.T) {
 	tests := []struct {
-		name      string
-		input     string
-		wantNil   bool
-		wantErr   bool
+		name       string
+		input      string
+		wantNil    bool
+		wantErr    bool
 		wantScheme string
 		wantHost   string
 		wantPort   int

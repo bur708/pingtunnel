@@ -1,6 +1,8 @@
 package pingtunnel
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"fmt"
 	"net"
 	"sync"
@@ -14,11 +16,24 @@ import (
 // scheme so recvICMP can tell legacy / FEC / KCP packets apart from byte 0
 // alone, before parsing further.
 //
-//	[0]  version/flag byte, always KCPVersion for a valid KCP packet
-//	[1:] raw kcp.KCP segment bytes, passed to (*KCPSession).Input as-is
+//	[0]    version/flag byte, always KCPVersion for a valid KCP packet
+//	[1:9]  truncated HMAC-SHA256(macKey, segment)
+//	[9:]   raw kcp.KCP segment bytes, passed to (*KCPSession).Input as-is
+//
+// The MAC exists because kcp.KCP's Input() has no authentication of its
+// own: routing to a session is keyed only by (source IP, ICMP echo id),
+// both attacker-observable/spoofable, and the "conv" field kcp-go uses to
+// disambiguate conversations is a fixed constant here (see kcpConv below),
+// not a secret. Without a MAC, an off-path attacker could forge segments
+// (e.g. an ACK claiming already-sent data was delivered) directly into an
+// established session's retransmit bookkeeping. Tying the tag to the same
+// key material that already gates the tunnel (the encryption key, or the
+// fallback numeric -key) means forging a valid segment requires knowing
+// that secret, same as everywhere else in this protocol.
 const (
 	KCPVersion    byte = 2
-	KCPHeaderSize      = 1
+	kcpMacSize         = 8
+	KCPHeaderSize      = 1 + kcpMacSize
 )
 
 // kcpConv is the KCP "conversation id" every session on both sides uses.
@@ -35,25 +50,56 @@ func IsKCPPacket(b []byte) bool {
 	return len(b) >= KCPHeaderSize && b[0] == KCPVersion
 }
 
-// buildKCPPacket prepends the KCP marker byte to a raw segment produced by
-// a kcp.KCP engine's output callback.
-func buildKCPPacket(segment []byte) []byte {
+// deriveKCPMacKey derives the key used to authenticate KCP segments (see
+// KCPHeaderSize's doc comment) from whatever secret already gates this
+// tunnel: the encryption key when -encrypt is set, otherwise the numeric
+// -key. Both are run through SHA-256 with a fixed domain-separation
+// prefix rather than used directly, so this key is never the same bytes
+// as the AEAD key itself even when -encrypt is also enabled.
+func deriveKCPMacKey(cryptoConfig *CryptoConfig, key int) []byte {
+	h := sha256.New()
+	h.Write([]byte("pingtunnel-kcp-mac|"))
+	if cryptoConfig != nil && len(cryptoConfig.Key) > 0 {
+		h.Write(cryptoConfig.Key)
+	} else {
+		h.Write([]byte(fmt.Sprintf("%d", key)))
+	}
+	return h.Sum(nil)
+}
+
+// kcpTag computes the truncated HMAC-SHA256 tag for segment under macKey.
+func kcpTag(macKey, segment []byte) []byte {
+	mac := hmac.New(sha256.New, macKey)
+	mac.Write(segment)
+	return mac.Sum(nil)[:kcpMacSize]
+}
+
+// buildKCPPacket prepends the KCP marker byte and an HMAC tag (keyed by
+// macKey) to a raw segment produced by a kcp.KCP engine's output callback.
+func buildKCPPacket(segment []byte, macKey []byte) []byte {
 	out := make([]byte, KCPHeaderSize+len(segment))
 	out[0] = KCPVersion
+	copy(out[1:KCPHeaderSize], kcpTag(macKey, segment))
 	copy(out[KCPHeaderSize:], segment)
 	return out
 }
 
-// ParseKCPPacket strips the KCP marker byte, returning the raw segment
-// bytes ready for (*KCPSession).Input.
-func ParseKCPPacket(b []byte) ([]byte, error) {
+// ParseKCPPacket verifies the HMAC tag (keyed by macKey) and strips the
+// header, returning the raw segment bytes ready for (*KCPSession).Input.
+// A missing/wrong-key/forged tag is indistinguishable from network
+// corruption from the caller's point of view - both are just dropped.
+func ParseKCPPacket(b []byte, macKey []byte) ([]byte, error) {
 	if len(b) < KCPHeaderSize {
 		return nil, fmt.Errorf("kcp: packet too short for header: %d bytes", len(b))
 	}
 	if b[0] != KCPVersion {
 		return nil, fmt.Errorf("kcp: unsupported version byte %d", b[0])
 	}
-	return b[KCPHeaderSize:], nil
+	segment := b[KCPHeaderSize:]
+	if !hmac.Equal(b[1:KCPHeaderSize], kcpTag(macKey, segment)) {
+		return nil, fmt.Errorf("kcp: invalid packet tag")
+	}
+	return segment, nil
 }
 
 // KCPConfig tunes the underlying KCP engine. Defaults roughly match kcp-go's
@@ -265,6 +311,11 @@ func (s *KCPSession) Done() <-chan struct{} {
 // converges.
 type KCPTransport struct {
 	cfg *KCPConfig
+	// macKey authenticates every KCP segment on the wire (see KCPHeaderSize's
+	// doc comment on kcp_transport.go); both peers must derive the same key,
+	// which client.go/server.go do from the same secret that already gates
+	// the tunnel (the encryption key, or the numeric -key as a fallback).
+	macKey []byte
 	// deliver is called, from a dedicated per-session goroutine, for every
 	// fully-reassembled inbound application message. peer/id identify
 	// which destKey it came from, so the caller can tag it the same way a
@@ -279,11 +330,23 @@ type KCPTransport struct {
 // manager for the given tuning parameters. deliver may be nil if the
 // caller only ever sends (never expects inbound application data on these
 // sessions) - not a realistic pingtunnel setup, but convenient for tests.
-func NewKCPTransport(cfg *KCPConfig, deliver func(msg []byte, peer *net.IPAddr, id int)) *KCPTransport {
+func NewKCPTransport(cfg *KCPConfig, macKey []byte, deliver func(msg []byte, peer *net.IPAddr, id int)) *KCPTransport {
 	if cfg == nil {
 		cfg = DefaultKCPConfig()
 	}
-	return &KCPTransport{cfg: cfg, deliver: deliver, sessions: make(map[string]*KCPSession)}
+	return &KCPTransport{cfg: cfg, macKey: macKey, deliver: deliver, sessions: make(map[string]*KCPSession)}
+}
+
+// BuildPacket frames a raw segment for the wire, tagged with this
+// transport's macKey.
+func (t *KCPTransport) BuildPacket(segment []byte) []byte {
+	return buildKCPPacket(segment, t.macKey)
+}
+
+// ParsePacket verifies and strips a wire-framed packet's header, using this
+// transport's macKey.
+func (t *KCPTransport) ParsePacket(b []byte) ([]byte, error) {
+	return ParseKCPPacket(b, t.macKey)
 }
 
 // Session returns the session for destKey, creating one via sendRaw (and

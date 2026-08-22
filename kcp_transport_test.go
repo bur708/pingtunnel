@@ -133,7 +133,7 @@ func TestKCPSessionBidirectional(t *testing.T) {
 }
 
 func TestKCPTransportPerDestKeySessions(t *testing.T) {
-	transport := NewKCPTransport(fastTestKCPConfig(), nil)
+	transport := NewKCPTransport(fastTestKCPConfig(), nil, nil)
 	defer transport.Close()
 
 	var sent []byte
@@ -164,10 +164,10 @@ func TestKCPTransportDeliversAcrossTwoTransports(t *testing.T) {
 	// bare ACKs from KCP's own protocol, never handed to deliver.
 	delivered := make(chan []byte, 100)
 	var transportA, transportB *KCPTransport
-	transportA = NewKCPTransport(fastTestKCPConfig(), func(msg []byte, peer *net.IPAddr, id int) {
+	transportA = NewKCPTransport(fastTestKCPConfig(), nil, func(msg []byte, peer *net.IPAddr, id int) {
 		t.Errorf("unexpected inbound message on A: %q", msg)
 	})
-	transportB = NewKCPTransport(fastTestKCPConfig(), func(msg []byte, peer *net.IPAddr, id int) {
+	transportB = NewKCPTransport(fastTestKCPConfig(), nil, func(msg []byte, peer *net.IPAddr, id int) {
 		delivered <- msg
 	})
 	defer transportA.Close()
@@ -214,8 +214,9 @@ func TestKCPTransportDeliversAcrossTwoTransports(t *testing.T) {
 }
 
 func TestKCPWireFraming(t *testing.T) {
+	macKey := []byte("test-mac-key")
 	segment := []byte{1, 2, 3, 4, 5}
-	pkt := buildKCPPacket(segment)
+	pkt := buildKCPPacket(segment, macKey)
 
 	if !IsKCPPacket(pkt) {
 		t.Fatalf("expected IsKCPPacket to be true")
@@ -224,7 +225,7 @@ func TestKCPWireFraming(t *testing.T) {
 		t.Fatalf("raw segment without marker should not look like a KCP packet")
 	}
 
-	got, err := ParseKCPPacket(pkt)
+	got, err := ParseKCPPacket(pkt, macKey)
 	if err != nil {
 		t.Fatalf("ParseKCPPacket: %v", err)
 	}
@@ -232,8 +233,27 @@ func TestKCPWireFraming(t *testing.T) {
 		t.Fatalf("round-trip mismatch: want %v got %v", segment, got)
 	}
 
-	if _, err := ParseKCPPacket([]byte{}); err == nil {
+	if _, err := ParseKCPPacket([]byte{}, macKey); err == nil {
 		t.Fatalf("expected error parsing an empty packet")
+	}
+}
+
+// Regression test for the KCP ACK-injection finding: a segment forged (or
+// tagged with the wrong key) by someone who doesn't know macKey must be
+// rejected before ever reaching (*KCPSession).Input, even if it carries a
+// well-formed version byte and a plausible-looking KCP segment body.
+func TestKCPWireFramingRejectsWrongMacKey(t *testing.T) {
+	segment := []byte{1, 2, 3, 4, 5}
+	pkt := buildKCPPacket(segment, []byte("real-key"))
+
+	if _, err := ParseKCPPacket(pkt, []byte("wrong-key")); err == nil {
+		t.Fatalf("expected error parsing a packet tagged with a different key")
+	}
+
+	forged := append([]byte(nil), pkt...)
+	forged[len(forged)-1] ^= 0xFF // flip a byte in the segment after tagging
+	if _, err := ParseKCPPacket(forged, []byte("real-key")); err == nil {
+		t.Fatalf("expected error parsing a tampered segment")
 	}
 }
 

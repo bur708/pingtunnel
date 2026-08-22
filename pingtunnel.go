@@ -62,7 +62,7 @@ func sendICMP(id int, sequence int, conn icmp.PacketConn, server *net.IPAddr, ta
 	if kcpTransport != nil {
 		destKey := fmt.Sprintf("%s|%d", server.String(), id)
 		session := kcpTransport.Session(destKey, server, id, func(segment []byte) {
-			if err := writeICMP(conn, id, 0, sproto, server, buildKCPPacket(segment)); err != nil {
+			if err := writeICMP(conn, id, 0, sproto, server, kcpTransport.BuildPacket(segment)); err != nil {
 				loggo.Error("sendICMP kcp write error %s %s", server.String(), err)
 			}
 		})
@@ -176,7 +176,7 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, 
 		}
 
 		if kcpTransport != nil && IsKCPPacket(payloadData) {
-			segment, err := ParseKCPPacket(payloadData)
+			segment, err := kcpTransport.ParsePacket(payloadData)
 			if err != nil {
 				loggo.Debug("recvICMP kcp header parse error: %s", err)
 				continue
@@ -188,7 +188,7 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, 
 			// why that's required, not just convenient.
 			destKey := fmt.Sprintf("%s|%d", src.String(), echoId)
 			session := kcpTransport.Session(destKey, src, echoId, func(seg []byte) {
-				if err := writeICMP(conn, echoId, 0, kcpReplySproto, src, buildKCPPacket(seg)); err != nil {
+				if err := writeICMP(conn, echoId, 0, kcpReplySproto, src, kcpTransport.BuildPacket(seg)); err != nil {
 					loggo.Error("recvICMP kcp write error %s %s", src.String(), err)
 				}
 			})

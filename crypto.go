@@ -97,9 +97,18 @@ func deriveKey(keyInput string, keySize int) ([]byte, error) {
 		}
 	}
 
-	// If not valid base64 or wrong size, use PBKDF2 to derive key
-	salt := []byte("pingtunnel-salt") // Fixed salt for deterministic key derivation
-	iterations := 10000               // Standard iteration count
+	// If not valid base64 or wrong size, use PBKDF2 to derive key.
+	//
+	// The salt is a fixed constant, not a per-installation random value:
+	// client and server have no channel to exchange one (the passphrase
+	// itself is the only shared secret, set out-of-band by the operator),
+	// so a random salt can't be reproduced independently on both ends.
+	// This means the salt's job here is domain separation, not defeating
+	// precomputation - the actual defense against offline brute force of
+	// a weak passphrase is the iteration count (OWASP's current PBKDF2-
+	// HMAC-SHA256 recommendation) plus using a high-entropy -encrypt-key.
+	salt := []byte("pingtunnel-salt")
+	iterations := 600000
 	return pbkdf2.Key([]byte(keyInput), salt, iterations, keySize, sha256.New), nil
 }
 

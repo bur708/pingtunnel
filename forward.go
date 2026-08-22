@@ -70,6 +70,17 @@ func (f *ForwardConfig) Address() string {
 
 // DialThroughProxy establishes a connection to the target address through the proxy
 func DialThroughProxy(config *ForwardConfig, targetAddr string, timeout time.Duration) (net.Conn, error) {
+	// targetAddr ultimately comes from a SOCKS5 domain name supplied by
+	// whoever can reach this client's local proxy, tunneled here as an
+	// unvalidated proto3 string. httpConnectHandshake splices it directly
+	// into a "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n" request line, so a
+	// domain containing CR/LF would smuggle extra headers/requests into
+	// the upstream HTTP proxy. Reject control characters up front, before
+	// either the socks5 or http handshake path uses it.
+	if err := validateProxyTargetAddr(targetAddr); err != nil {
+		return nil, err
+	}
+
 	// Connect to proxy
 	conn, err := net.DialTimeout("tcp", config.Address(), timeout)
 	if err != nil {
@@ -106,6 +117,18 @@ func DialThroughProxy(config *ForwardConfig, targetAddr string, timeout time.Dur
 	}
 
 	return conn, nil
+}
+
+// validateProxyTargetAddr rejects control characters (notably CR/LF) so a
+// tunneled destination address can never smuggle extra headers/requests
+// into a text-based handshake with the configured forward proxy.
+func validateProxyTargetAddr(targetAddr string) error {
+	for _, r := range targetAddr {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("invalid target address: contains control character")
+		}
+	}
+	return nil
 }
 
 // DialUDPThroughProxy establishes a SOCKS5 UDP ASSOCIATE and returns a UDP relay association.

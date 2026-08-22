@@ -330,7 +330,8 @@ func (p *Client) Run() error {
 	// needs recv, which doesn't exist until now - same reason p.conn
 	// itself is only set inside Run(), not the constructor.
 	if p.kcpConfig != nil {
-		p.kcpTransport = NewKCPTransport(p.kcpConfig, func(msg []byte, peer *net.IPAddr, id int) {
+		macKey := deriveKCPMacKey(p.cryptoConfig, p.key)
+		p.kcpTransport = NewKCPTransport(p.kcpConfig, macKey, func(msg []byte, peer *net.IPAddr, id int) {
 			deliverPayload(msg, p.cryptoConfig, recv, peer, id, 0)
 		})
 	}

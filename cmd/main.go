@@ -279,6 +279,15 @@ func main() {
 	})
 	loggo.Info("start...")
 	loggo.Info("key %d", *key)
+	if cryptoConfig == nil {
+		// Without -encrypt every MyMsg, including this numeric key, goes
+		// out as cleartext inside the ICMP payload - anyone who can
+		// observe the traffic (a transit hop, a shared L2 segment) can
+		// read the key and then send crafted packets the server will
+		// treat as authenticated. This is a config choice, not a bug, but
+		// operators should know before relying on it.
+		loggo.Warn("running without -encrypt: the key and all tunneled traffic are sent in cleartext; add -encrypt/-encrypt-key if this link is not already trusted/private")
+	}
 	if fecConfig != nil {
 		loggo.Info("FEC enabled: data=%d parity=%d", fecConfig.DataShards, fecConfig.ParityShards)
 	}
