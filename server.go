@@ -14,7 +14,10 @@ import (
 	"time"
 )
 
-func NewServer(icmpAddr string, key int, maxconn int, maxprocessthread int, maxprocessbuffer int, connecttmeout int, cryptoConfig *CryptoConfig, forwardConfig *ForwardConfig, fecConfig *FECConfig, kcpConfig *KCPConfig) (*Server, error) {
+func NewServer(icmpAddr string, key int, maxconn int, maxprocessthread int, maxprocessbuffer int, connecttmeout int, cryptoConfig *CryptoConfig, forwardConfig *ForwardConfig, fecConfig *FECConfig, kcpConfig *KCPConfig, connectHandshakeTimeoutSec int) (*Server, error) {
+	if connectHandshakeTimeoutSec <= 0 {
+		connectHandshakeTimeoutSec = 5
+	}
 	var fecSender *FECSender
 	var fecReceiver *FECReceiver
 	var peerModes *PeerModeTracker
@@ -49,6 +52,7 @@ func NewServer(icmpAddr string, key int, maxconn int, maxprocessthread int, maxp
 		maxprocessthread: maxprocessthread,
 		maxprocessbuffer: maxprocessbuffer,
 		connecttmeout:    connecttmeout,
+		connectTimeout:   time.Duration(connectHandshakeTimeoutSec) * time.Second,
 		cryptoConfig:     cryptoConfig,
 		forwardConfig:    forwardConfig,
 		fecConfig:        fecConfig,
@@ -76,13 +80,20 @@ type Server struct {
 	maxprocessthread int
 	maxprocessbuffer int
 	connecttmeout    int
-	cryptoConfig     *CryptoConfig
-	forwardConfig    *ForwardConfig
-	fecConfig        *FECConfig
-	fecSender        *FECSender
-	fecReceiver      *FECReceiver
-	kcpConfig        *KCPConfig
-	kcpTransport     *KCPTransport
+	// connectTimeout bounds how long RecvTCP waits for the tcpmode
+	// handshake ack (conn.fm.IsConnected()) to come back from the client,
+	// separate from connecttmeout (which bounds the actual outbound dial
+	// to the target). Distinct from the client's own connectTimeout field
+	// but conceptually the same knob, set from the same -connect-timeout
+	// flag on both sides - see NewClient's connectTimeoutSec.
+	connectTimeout time.Duration
+	cryptoConfig   *CryptoConfig
+	forwardConfig  *ForwardConfig
+	fecConfig      *FECConfig
+	fecSender      *FECSender
+	fecReceiver    *FECReceiver
+	kcpConfig      *KCPConfig
+	kcpTransport   *KCPTransport
 	// peerModes is non-nil only in adaptive mode (neither -fec nor -kcp
 	// pinned this server to a single mode) - see NewServer/peerTransport.
 	peerModes *PeerModeTracker
@@ -479,7 +490,7 @@ func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
 		}
 		now := common.GetNowUpdateInSecond()
 		diffclose := now.Sub(startConnectTime)
-		if diffclose > time.Second*5 {
+		if diffclose > p.connectTimeout {
 			loggo.Info("can not connect remote tcp %s %s", conn.id, conn.tcpaddrTarget.String())
 			p.close(conn)
 			p.remoteError(conn.echoId, conn.echoSeq, id, conn.rproto, src)

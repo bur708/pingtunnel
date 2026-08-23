@@ -24,7 +24,11 @@ const (
 func NewClient(addr string, server string, target string, timeout int, key int, icmpAddr string,
 	tcpmode int, tcpmode_buffersize int, tcpmode_maxwin int, tcpmode_resend_timems int, tcpmode_compress int,
 	tcpmode_stat int, open_sock5 int, maxconn int, sock5_filter *func(addr string) bool, cryptoConfig *CryptoConfig,
-	sock5_user string, sock5_pass string, fecConfig *FECConfig, kcpConfig *KCPConfig) (*Client, error) {
+	sock5_user string, sock5_pass string, fecConfig *FECConfig, kcpConfig *KCPConfig, connectTimeoutSec int) (*Client, error) {
+
+	if connectTimeoutSec <= 0 {
+		connectTimeoutSec = 5
+	}
 
 	var ipaddr *net.UDPAddr
 	var tcpaddr *net.TCPAddr
@@ -68,6 +72,7 @@ func NewClient(addr string, server string, target string, timeout int, key int, 
 		targetAddr:            target,
 		icmpAddr:              icmpAddr,
 		timeout:               timeout,
+		connectTimeout:        time.Duration(connectTimeoutSec) * time.Second,
 		key:                   key,
 		tcpmode:               tcpmode,
 		tcpmode_buffersize:    tcpmode_buffersize,
@@ -103,6 +108,7 @@ type Client struct {
 	sequence int
 
 	timeout               int
+	connectTimeout        time.Duration
 	sproto                int
 	rproto                int
 	key                   int
@@ -475,7 +481,7 @@ func (p *Client) AcceptTcpConn(conn *net.TCPConn, targetAddr string) {
 		}
 		now := common.GetNowUpdateInSecond()
 		diffclose := now.Sub(startConnectTime)
-		if diffclose > time.Second*5 {
+		if diffclose > p.connectTimeout {
 			loggo.Info("can not connect remote tcp %s %s", uuid, tcpsrcaddr.String())
 			p.close(clientConn)
 			return

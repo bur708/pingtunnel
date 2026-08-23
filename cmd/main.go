@@ -164,6 +164,7 @@ func main() {
 	server := flag.String("s", "", "server addr")
 	icmpListen := flag.String("icmp_l", "0.0.0.0", "listen address for ICMP traffic")
 	timeout := flag.Int("timeout", 60, "conn timeout")
+	connectTimeout := flag.Int("connect-timeout", 15, "seconds to wait for a new tcpmode connection's handshake ack before giving up; raise this if many connections open at once over a slow/lossy link (e.g. a system-wide proxy client) and time out before the ack gets through")
 	key := flag.Int("key", 0, "key")
 	encryption := flag.String("encrypt", "", "encryption mode: aes128, aes256, chacha20")
 	encryptionKey := flag.String("encrypt-key", "", "encryption key (base64 or passphrase)")
@@ -313,7 +314,7 @@ func main() {
 			loggo.Info("Forward proxy configured: %s", *forward)
 		}
 
-		s, err := pingtunnel.NewServer(*icmpListen, *key, *maxconn, *max_process_thread, *max_process_buffer, *conntt, cryptoConfig, forwardConfig, fecConfig, kcpConfig)
+		s, err := pingtunnel.NewServer(*icmpListen, *key, *maxconn, *max_process_thread, *max_process_buffer, *conntt, cryptoConfig, forwardConfig, fecConfig, kcpConfig, *connectTimeout)
 		if err != nil {
 			loggo.Error("ERROR: %s", err.Error())
 			return
@@ -368,7 +369,7 @@ func main() {
 
 		c, err := pingtunnel.NewClient(*listen, *server, *target, *timeout, *key, *icmpListen,
 			*tcpmode, *tcpmode_buffersize, *tcpmode_maxwin, *tcpmode_resend_timems, *tcpmode_compress,
-			*tcpmode_stat, *open_sock5, *maxconn, &filter, cryptoConfig, *sock5_user, *sock5_pass, fecConfig, kcpConfig)
+			*tcpmode_stat, *open_sock5, *maxconn, &filter, cryptoConfig, *sock5_user, *sock5_pass, fecConfig, kcpConfig, *connectTimeout)
 		if err != nil {
 			loggo.Error("ERROR: %s", err.Error())
 			return
