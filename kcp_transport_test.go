@@ -283,3 +283,74 @@ func assertMessagesEqual(t *testing.T, want, got [][]byte) {
 		}
 	}
 }
+
+// Regression test for the KCP send-queue growing without bound: a sender
+// feeding data faster than the real link drains it (e.g. a system-wide VPN
+// client routing far more traffic than a narrow ICMP path can carry) used
+// to have kcp.KCP.Send accept every message unconditionally - the library
+// enforces no cap of its own (see KCPConfig.MaxWaitSnd's doc comment), and
+// with NoCongestion=1 nothing else throttled ingestion either. Simulates
+// the worst case, a completely stalled peer (sendRaw is a black hole, so
+// nothing is ever acked and the backlog can never drain), and asserts Send
+// eventually refuses rather than buffering forever.
+func TestKCPSessionSendBackpressureDropsWhenLinkStalled(t *testing.T) {
+	cfg := &KCPConfig{
+		NoDelay: 1, Interval: 10, Resend: 2, NoCongestion: 1,
+		SndWnd: 16, RcvWnd: 16, MTU: 1200,
+		MaxWaitSnd:                8,
+		SendBackpressureTimeoutMs: 30,
+	}
+	s := NewKCPSession(cfg, func(segment []byte) {
+		// Black hole: simulates a peer that never receives anything, so
+		// nothing is ever acked and WaitSnd can never drop.
+	})
+	defer s.Close()
+
+	msg := []byte("some application data that needs to go out")
+
+	done := make(chan error, 1)
+	go func() {
+		var err error
+		for i := 0; i < 200; i++ {
+			if err = s.Send(msg); err != nil {
+				break
+			}
+		}
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected Send to eventually refuse once the backlog cap is hit, but it accepted 200 messages into a session whose peer never acks anything")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Send blocked far longer than SendBackpressureTimeoutMs*iterations should allow - looks like it's buffering unboundedly instead of dropping")
+	}
+}
+
+// Companion to the stalled-link test above: a healthy (if lossy) link must
+// still be able to push a send volume well past MaxWaitSnd's cap over time,
+// since the backlog keeps draining as ACKs arrive. The backpressure fix
+// must not turn into a throughput regression for ordinary operation.
+func TestKCPSessionSendDoesNotSpuriouslyDropOnHealthyLink(t *testing.T) {
+	cfg := fastTestKCPConfig()
+	cfg.MaxWaitSnd = 8
+	cfg.SendBackpressureTimeoutMs = 2000
+
+	a, b := newConnectedSessions(t, cfg, 0)
+	defer a.Close()
+	defer b.Close()
+
+	const n = 500
+	want := make([][]byte, n)
+	for i := 0; i < n; i++ {
+		want[i] = []byte(fmt.Sprintf("msg-%d", i))
+		if err := a.Send(want[i]); err != nil {
+			t.Fatalf("Send %d unexpectedly failed on a healthy link: %v", i, err)
+		}
+	}
+
+	got := collectMessages(t, b, n, 10*time.Second)
+	assertMessagesEqual(t, want, got)
+}

@@ -115,6 +115,22 @@ type KCPConfig struct {
 	SndWnd       int // send window, in segments
 	RcvWnd       int // receive window, in segments
 	MTU          int // max size of one KCP segment on the wire (excludes our 1-byte marker)
+	// MaxWaitSnd caps how many segments (kcp.KCP.WaitSnd(): unacked +
+	// still-queued) a session may hold before Send blocks. kcp.KCP.Send
+	// itself never enforces any such limit - see the vendored
+	// github.com/xtaci/kcp-go's KCP.Send, which unconditionally appends to
+	// snd_queue - and with NoCongestion=1 nothing else throttles ingestion
+	// either, so a sender feeding data faster than the real link drains
+	// (routine for a system-wide VPN client tunnelling over an ICMP path
+	// far narrower than local traffic) would otherwise grow this queue
+	// without bound until the process is OOM-killed. 0 defaults to 4x
+	// SndWnd: enough headroom to absorb a burst without stalling every
+	// send, small enough to bound memory to a few MB.
+	MaxWaitSnd int
+	// SendBackpressureTimeoutMs bounds how long Send waits for the backlog
+	// to drop below MaxWaitSnd before giving up and dropping the message.
+	// 0 defaults to 1000ms.
+	SendBackpressureTimeoutMs int
 }
 
 // DefaultKCPConfig returns sane defaults for a lossy, low-bandwidth link.
@@ -136,6 +152,20 @@ func (c *KCPConfig) updateInterval() time.Duration {
 		interval = 20
 	}
 	return time.Duration(interval) * time.Millisecond
+}
+
+func (c *KCPConfig) maxWaitSnd(sndWnd int) int {
+	if c.MaxWaitSnd > 0 {
+		return c.MaxWaitSnd
+	}
+	return sndWnd * 4
+}
+
+func (c *KCPConfig) sendBackpressureTimeout() time.Duration {
+	if c.SendBackpressureTimeoutMs > 0 {
+		return time.Duration(c.SendBackpressureTimeoutMs) * time.Millisecond
+	}
+	return time.Second
 }
 
 // KCPSession is one reliable, ordered, message-boundary-preserving pipe
@@ -160,6 +190,9 @@ type KCPSession struct {
 	recv   chan []byte
 	exit   chan struct{}
 	once   sync.Once
+
+	maxWaitSnd          int
+	backpressureTimeout time.Duration
 }
 
 // NewKCPSession creates a session and starts its background update loop.
@@ -200,6 +233,9 @@ func NewKCPSession(cfg *KCPConfig, sendRaw func(segment []byte)) *KCPSession {
 		mtu = FECMaxPayload
 	}
 	s.engine.SetMtu(mtu)
+
+	s.maxWaitSnd = cfg.maxWaitSnd(sndWnd)
+	s.backpressureTimeout = cfg.sendBackpressureTimeout()
 
 	go s.updateLoop(cfg.updateInterval())
 
@@ -253,7 +289,24 @@ func (s *KCPSession) deliver(msgs [][]byte) {
 }
 
 // Send queues msg for reliable delivery. Safe for concurrent use.
+//
+// Blocks while the session's outstanding backlog (kcp.KCP.WaitSnd(): segments
+// either in flight or still queued behind the send window) is at or above
+// maxWaitSnd, giving the background updateLoop goroutine (which isn't
+// blocked by this - it only needs s.mu, released while waiting here) a
+// chance to drain it as ACKs arrive. If the backlog is still full after
+// backpressureTimeout - meaning the real link genuinely can't keep up, not
+// just a momentary burst - the message is dropped rather than buffered
+// forever. Without this, a sender feeding data faster than the tunnel's
+// real throughput (e.g. a system-wide VPN client routing far more traffic
+// than a narrow ICMP path can carry) would grow the backlog in memory
+// without bound, since neither kcp.KCP.Send nor NoCongestion=1 imposes any
+// cap of their own - see MaxWaitSnd's doc comment.
 func (s *KCPSession) Send(msg []byte) error {
+	if err := s.waitForRoom(); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	ret := s.engine.Send(msg)
 	if ret == 0 {
@@ -266,6 +319,30 @@ func (s *KCPSession) Send(msg []byte) error {
 		return fmt.Errorf("kcp: send failed, code %d", ret)
 	}
 	return nil
+}
+
+// waitForRoom blocks until the session's backlog drops below maxWaitSnd, the
+// session is closed, or backpressureTimeout elapses (whichever comes first).
+func (s *KCPSession) waitForRoom() error {
+	deadline := time.Now().Add(s.backpressureTimeout)
+	for {
+		s.mu.Lock()
+		waiting := s.engine.WaitSnd()
+		s.mu.Unlock()
+
+		if waiting < s.maxWaitSnd {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("kcp: send queue backlog too high (%d segments >= cap %d), dropping message", waiting, s.maxWaitSnd)
+		}
+
+		select {
+		case <-time.After(5 * time.Millisecond):
+		case <-s.exit:
+			return fmt.Errorf("kcp: session closed while waiting for send backlog to drain")
+		}
+	}
 }
 
 // Input feeds raw bytes received from the wire (already stripped of the
