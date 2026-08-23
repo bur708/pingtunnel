@@ -228,6 +228,27 @@ func (p *Server) processPacket(packet *Packet) {
 		return
 	}
 
+	// A negative Rproto is a sentinel the server itself uses ("not
+	// applicable, this is a reply") - see sendICMP calls throughout this
+	// file, all of which pass -1 for it - and no legitimate client ever
+	// sends one (RECV_PROTO, the only value client.go ever uses, is 0).
+	// Its only legitimate purpose is being echoed back to the client
+	// unread; the server itself must never act on a packet carrying one.
+	// Skipping this check let a server's own reply that got delivered
+	// back to its own raw ICMP socket - which happens routinely when
+	// client and server are literally the same host (loopback testing:
+	// the loopback interface delivers a sent packet to every matching
+	// local socket, including the sender's own) - be reprocessed as a
+	// fresh incoming request. That reply carries this same -1 sentinel,
+	// which then got used (in the PING branch) as the *wire* ICMP type
+	// of the next reply (an invalid type - byte 255 on the wire, since
+	// -1 truncates to 0xFF), which itself loops back the same way: an
+	// unbounded, unrate-limited self-sustaining flood, observed at
+	// upward of 1500 packets/sec until this was found and fixed.
+	if packet.my.Rproto < 0 {
+		return
+	}
+
 	if packet.my.Type == (int32)(MyMsg_PING) {
 		t := time.Time{}
 		t.UnmarshalBinary(packet.my.Data)
