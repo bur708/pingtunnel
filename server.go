@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-func NewServer(icmpAddr string, key int, maxconn int, maxprocessthread int, maxprocessbuffer int, connecttmeout int, cryptoConfig *CryptoConfig, forwardConfig *ForwardConfig, fecConfig *FECConfig, kcpConfig *KCPConfig, connectHandshakeTimeoutSec int) (*Server, error) {
+func NewServer(icmpAddr string, key int, maxconn int, maxprocessthread int, maxprocessbuffer int, connecttmeout int, cryptoConfig *CryptoConfig, forwardConfig *ForwardConfig, fecConfig *FECConfig, kcpConfig *KCPConfig, connectHandshakeTimeoutSec int, maxPPS int) (*Server, error) {
 	if connectHandshakeTimeoutSec <= 0 {
 		connectHandshakeTimeoutSec = 5
 	}
@@ -60,6 +60,7 @@ func NewServer(icmpAddr string, key int, maxconn int, maxprocessthread int, maxp
 		fecReceiver:      fecReceiver,
 		kcpConfig:        kcpConfig,
 		peerModes:        peerModes,
+		rateLimiter:      NewRateLimiter(maxPPS),
 	}
 
 	if maxprocessthread > 0 {
@@ -96,7 +97,8 @@ type Server struct {
 	kcpTransport   *KCPTransport
 	// peerModes is non-nil only in adaptive mode (neither -fec nor -kcp
 	// pinned this server to a single mode) - see NewServer/peerTransport.
-	peerModes *PeerModeTracker
+	peerModes   *PeerModeTracker
+	rateLimiter *RateLimiter
 
 	icmpAddr string
 
@@ -157,7 +159,7 @@ func (p *Server) Run() error {
 			deliverPayload(msg, p.cryptoConfig, recv, peer, id, 0)
 		})
 	}
-	go recvICMP(&p.workResultLock, &p.exit, *p.conn, recv, p.cryptoConfig, p.fecReceiver, p.kcpTransport, RECV_PROTO, p.peerModes)
+	go recvICMP(&p.workResultLock, &p.exit, *p.conn, recv, p.cryptoConfig, p.fecReceiver, p.kcpTransport, RECV_PROTO, p.peerModes, p.rateLimiter)
 
 	go func() {
 		defer common.CrashLog()
@@ -257,7 +259,7 @@ func (p *Server) processPacket(packet *Packet) {
 		sendICMP(packet.echoId, packet.echoSeq, *p.conn, packet.src, "", "", (uint32)(MyMsg_PING), packet.my.Data,
 			(int)(packet.my.Rproto), -1, p.key,
 			0, 0, 0, 0, 0, 0,
-			0, p.cryptoConfig, fecSender, kcpTransport)
+			0, p.cryptoConfig, fecSender, kcpTransport, p.rateLimiter)
 		return
 	}
 
@@ -524,7 +526,7 @@ func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
 			sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, (uint32)(MyMsg_DATA), mb,
 				conn.rproto, -1, p.key, 0,
 				0, 0, 0, 0, 0,
-				0, p.cryptoConfig, fecSender, kcpTransport)
+				0, p.cryptoConfig, fecSender, kcpTransport, p.rateLimiter)
 			p.sendPacket++
 			p.sendPacketSize += (uint64)(len(mb))
 		}
@@ -626,7 +628,7 @@ mainLoop:
 				sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, (uint32)(MyMsg_DATA), mb,
 					conn.rproto, -1, p.key, 0,
 					0, 0, 0, 0, 0,
-					0, p.cryptoConfig, fecSender, kcpTransport)
+					0, p.cryptoConfig, fecSender, kcpTransport, p.rateLimiter)
 				p.sendPacket++
 				p.sendPacketSize += (uint64)(len(mb))
 			}
@@ -712,7 +714,7 @@ mainLoop:
 			sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, "", id, (uint32)(MyMsg_DATA), mb,
 				conn.rproto, -1, p.key, 0,
 				0, 0, 0, 0, 0,
-				0, p.cryptoConfig, fecSender, kcpTransport)
+				0, p.cryptoConfig, fecSender, kcpTransport, p.rateLimiter)
 			p.sendPacket++
 			p.sendPacketSize += (uint64)(len(mb))
 		}
@@ -799,7 +801,7 @@ func (p *Server) Recv(conn *ServerConn, id string, src *net.IPAddr) {
 		sendICMP(conn.echoId, conn.echoSeq, *p.conn, src, targetAddr, id, (uint32)(MyMsg_DATA), payload,
 			conn.rproto, -1, p.key, 0,
 			0, 0, 0, 0, 0,
-			0, p.cryptoConfig, fecSender, kcpTransport)
+			0, p.cryptoConfig, fecSender, kcpTransport, p.rateLimiter)
 
 		p.sendPacket++
 		p.sendPacketSize += (uint64)(len(payload))
@@ -913,7 +915,7 @@ func (p *Server) remoteError(echoId int, echoSeq int, uuid string, rprpto int, s
 	sendICMP(echoId, echoSeq, *p.conn, src, "", uuid, (uint32)(MyMsg_KICK), []byte{},
 		rprpto, -1, p.key,
 		0, 0, 0, 0, 0, 0, 0,
-		p.cryptoConfig, fecSender, kcpTransport)
+		p.cryptoConfig, fecSender, kcpTransport, p.rateLimiter)
 }
 
 func (p *Server) addConnError(addr string) {

@@ -24,7 +24,7 @@ const (
 func NewClient(addr string, server string, target string, timeout int, key int, icmpAddr string,
 	tcpmode int, tcpmode_buffersize int, tcpmode_maxwin int, tcpmode_resend_timems int, tcpmode_compress int,
 	tcpmode_stat int, open_sock5 int, maxconn int, sock5_filter *func(addr string) bool, cryptoConfig *CryptoConfig,
-	sock5_user string, sock5_pass string, fecConfig *FECConfig, kcpConfig *KCPConfig, connectTimeoutSec int) (*Client, error) {
+	sock5_user string, sock5_pass string, fecConfig *FECConfig, kcpConfig *KCPConfig, connectTimeoutSec int, maxPPS int) (*Client, error) {
 
 	if connectTimeoutSec <= 0 {
 		connectTimeoutSec = 5
@@ -91,6 +91,7 @@ func NewClient(addr string, server string, target string, timeout int, key int, 
 		fecSender:             fecSender,
 		fecReceiver:           fecReceiver,
 		kcpConfig:             kcpConfig,
+		rateLimiter:           NewRateLimiter(maxPPS),
 		nextResolveAt:         now,
 		resolveRetryBackoff:   2 * time.Second,
 	}
@@ -129,6 +130,7 @@ type Client struct {
 	fecReceiver  *FECReceiver
 	kcpConfig    *KCPConfig
 	kcpTransport *KCPTransport
+	rateLimiter  *RateLimiter
 
 	ipaddr  *net.UDPAddr
 	tcpaddr *net.TCPAddr
@@ -341,7 +343,7 @@ func (p *Client) Run() error {
 			deliverPayload(msg, p.cryptoConfig, recv, peer, id, 0)
 		})
 	}
-	go recvICMP(&p.workResultLock, &p.exit, *p.conn, recv, p.cryptoConfig, p.fecReceiver, p.kcpTransport, SEND_PROTO, nil)
+	go recvICMP(&p.workResultLock, &p.exit, *p.conn, recv, p.cryptoConfig, p.fecReceiver, p.kcpTransport, SEND_PROTO, nil, p.rateLimiter)
 
 	go func() {
 		defer common.CrashLog()
@@ -493,7 +495,7 @@ func (p *Client) AcceptTcpConn(conn *net.TCPConn, targetAddr string) {
 			sendICMP(p.id, p.sequence, *p.conn, p.ipaddrServer, targetAddr, clientConn.id, (uint32)(MyMsg_DATA), mb,
 				SEND_PROTO, RECV_PROTO, p.key,
 				p.tcpmode, p.tcpmode_buffersize, p.tcpmode_maxwin, p.tcpmode_resend_timems, p.tcpmode_compress, p.tcpmode_stat,
-				p.timeout, p.cryptoConfig, p.fecSender, nil)
+				p.timeout, p.cryptoConfig, p.fecSender, nil, p.rateLimiter)
 			p.sendPacket++
 			p.sendPacketSize += (uint64)(len(mb))
 		}
@@ -598,7 +600,7 @@ mainLoop:
 				sendICMP(p.id, p.sequence, *p.conn, p.ipaddrServer, targetAddr, clientConn.id, (uint32)(MyMsg_DATA), mb,
 					SEND_PROTO, RECV_PROTO, p.key,
 					p.tcpmode, 0, 0, 0, 0, 0,
-					0, p.cryptoConfig, p.fecSender, nil)
+					0, p.cryptoConfig, p.fecSender, nil, p.rateLimiter)
 				p.sendPacket++
 				p.sendPacketSize += (uint64)(len(mb))
 			}
@@ -689,7 +691,7 @@ mainLoop:
 			sendICMP(p.id, p.sequence, *p.conn, p.ipaddrServer, targetAddr, clientConn.id, (uint32)(MyMsg_DATA), mb,
 				SEND_PROTO, RECV_PROTO, p.key,
 				p.tcpmode, 0, 0, 0, 0, 0,
-				0, p.cryptoConfig, p.fecSender, nil)
+				0, p.cryptoConfig, p.fecSender, nil, p.rateLimiter)
 			p.sendPacket++
 			p.sendPacketSize += (uint64)(len(mb))
 		}
@@ -767,7 +769,7 @@ func (p *Client) Accept() error {
 		sendICMP(p.id, p.sequence, *p.conn, p.ipaddrServer, p.targetAddr, clientConn.id, (uint32)(MyMsg_DATA), bytes[:n],
 			SEND_PROTO, RECV_PROTO, p.key,
 			clientConn.tcpmode, 0, 0, 0, 0, 0,
-			p.timeout, p.cryptoConfig, p.fecSender, p.kcpTransport)
+			p.timeout, p.cryptoConfig, p.fecSender, p.kcpTransport, p.rateLimiter)
 
 		p.sequence++
 
@@ -925,7 +927,7 @@ func (p *Client) ping() {
 	sendICMP(p.id, p.sequence, *p.conn, p.ipaddrServer, "", "", (uint32)(MyMsg_PING), b,
 		SEND_PROTO, RECV_PROTO, p.key,
 		0, 0, 0, 0, 0, 0,
-		0, p.cryptoConfig, p.fecSender, p.kcpTransport)
+		0, p.cryptoConfig, p.fecSender, p.kcpTransport, p.rateLimiter)
 	loggo.Info("ping %s %s %d %d %d %d", p.addrServer, now.String(), p.sproto, p.rproto, p.id, p.sequence)
 	p.sequence++
 	if now.Sub(p.pongTime) > time.Second*3 {
@@ -1136,7 +1138,7 @@ func (p *Client) recvSock5UDP(relayConn *net.UDPConn, expectedIP net.IP, expecte
 		sendICMP(p.id, p.sequence, *p.conn, p.ipaddrServer, targetAddr, clientConn.id, (uint32)(MyMsg_DATA), payload,
 			SEND_PROTO, RECV_PROTO, p.key,
 			0, 0, 0, 0, 0, 0,
-			p.timeout, p.cryptoConfig, p.fecSender, p.kcpTransport)
+			p.timeout, p.cryptoConfig, p.fecSender, p.kcpTransport, p.rateLimiter)
 
 		p.sequence++
 		p.sendPacket++
@@ -1236,7 +1238,7 @@ func (p *Client) remoteError(uuid string) {
 	sendICMP(p.id, p.sequence, *p.conn, p.ipaddrServer, "", uuid, (uint32)(MyMsg_KICK), []byte{},
 		SEND_PROTO, RECV_PROTO, p.key,
 		0, 0, 0, 0, 0, 0,
-		0, p.cryptoConfig, p.fecSender, p.kcpTransport)
+		0, p.cryptoConfig, p.fecSender, p.kcpTransport, p.rateLimiter)
 }
 
 func (p *Client) AcceptDirectTcpConn(conn *net.TCPConn, targetAddr string) {

@@ -15,7 +15,7 @@ func TestNewClientConnectTimeout(t *testing.T) {
 	c, err := NewClient("127.0.0.1:0", "127.0.0.1", "", 60, 1, "0.0.0.0",
 		0, 0, 0, 0, 0,
 		0, 1, 0, nil, nil,
-		"", "", nil, nil, 20)
+		"", "", nil, nil, 20, 0)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -28,7 +28,7 @@ func TestNewClientConnectTimeoutFallsBackWhenZero(t *testing.T) {
 	c, err := NewClient("127.0.0.1:0", "127.0.0.1", "", 60, 1, "0.0.0.0",
 		0, 0, 0, 0, 0,
 		0, 1, 0, nil, nil,
-		"", "", nil, nil, 0)
+		"", "", nil, nil, 0, 0)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -38,7 +38,7 @@ func TestNewClientConnectTimeoutFallsBackWhenZero(t *testing.T) {
 }
 
 func TestNewServerConnectTimeout(t *testing.T) {
-	s, err := NewServer("0.0.0.0", 1, 0, 0, 0, 3000, nil, nil, nil, nil, 20)
+	s, err := NewServer("0.0.0.0", 1, 0, 0, 0, 3000, nil, nil, nil, nil, 20, 0)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestNewServerConnectTimeout(t *testing.T) {
 }
 
 func TestNewServerConnectTimeoutFallsBackWhenZero(t *testing.T) {
-	s, err := NewServer("0.0.0.0", 1, 0, 0, 0, 3000, nil, nil, nil, nil, 0)
+	s, err := NewServer("0.0.0.0", 1, 0, 0, 0, 3000, nil, nil, nil, nil, 0, 0)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}

@@ -17,7 +17,7 @@ import (
 func sendICMP(id int, sequence int, conn icmp.PacketConn, server *net.IPAddr, target string,
 	connId string, msgType uint32, data []byte, sproto int, rproto int, key int,
 	tcpmode int, tcpmode_buffer_size int, tcpmode_maxwin int, tcpmode_resend_time int, tcpmode_compress int, tcpmode_stat int,
-	timeout int, cryptoConfig *CryptoConfig, fecSender *FECSender, kcpTransport *KCPTransport) {
+	timeout int, cryptoConfig *CryptoConfig, fecSender *FECSender, kcpTransport *KCPTransport, rateLimiter *RateLimiter) {
 
 	m := &MyMsg{
 		Id:                  connId,
@@ -62,7 +62,7 @@ func sendICMP(id int, sequence int, conn icmp.PacketConn, server *net.IPAddr, ta
 	if kcpTransport != nil {
 		destKey := fmt.Sprintf("%s|%d", server.String(), id)
 		session := kcpTransport.Session(destKey, server, id, func(segment []byte) {
-			if err := writeICMP(conn, id, 0, sproto, server, kcpTransport.BuildPacket(segment)); err != nil {
+			if err := writeICMP(conn, id, 0, sproto, server, kcpTransport.BuildPacket(segment), rateLimiter); err != nil {
 				loggo.Error("sendICMP kcp write error %s %s", server.String(), err)
 			}
 		})
@@ -83,19 +83,28 @@ func sendICMP(id int, sequence int, conn icmp.PacketConn, server *net.IPAddr, ta
 		}
 	}
 
-	if err := writeICMP(conn, id, sequence, sproto, server, mb); err != nil {
+	if err := writeICMP(conn, id, sequence, sproto, server, mb, rateLimiter); err != nil {
 		loggo.Error("sendICMP Marshal error %s %s", server.String(), err)
 		return
 	}
 
 	for _, p := range parityPackets {
-		if err := writeICMP(conn, id, sequence, sproto, server, p); err != nil {
+		if err := writeICMP(conn, id, sequence, sproto, server, p, rateLimiter); err != nil {
 			loggo.Error("sendICMP fec parity send error %s %s", server.String(), err)
 		}
 	}
 }
 
-func writeICMP(conn icmp.PacketConn, id int, sequence int, sproto int, server *net.IPAddr, data []byte) error {
+// writeICMP is the one choke point every outgoing packet passes through
+// regardless of mode (none/FEC/KCP, tcpmode or relay, PING/DATA/KICK) -
+// see RateLimiter's doc comment for why that makes it the right place to
+// enforce a shared, tunnel-wide send-rate cap rather than doing it
+// per-connection.
+func writeICMP(conn icmp.PacketConn, id int, sequence int, sproto int, server *net.IPAddr, data []byte, rateLimiter *RateLimiter) error {
+	if !rateLimiter.Allow() {
+		return fmt.Errorf("writeICMP: rate limit exceeded, dropping packet to %s", server.String())
+	}
+
 	body := &icmp.Echo{
 		ID:   id,
 		Seq:  sequence,
@@ -125,7 +134,7 @@ func writeICMP(conn icmp.PacketConn, id int, sequence int, sproto int, server *n
 // KCP's reassembly buffer. In practice it's always the fixed sproto this
 // Client/Server already uses for everything it sends (SEND_PROTO for a
 // client, RECV_PROTO for a server), passed in by the caller.
-func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, recv chan<- *Packet, cryptoConfig *CryptoConfig, fecReceiver *FECReceiver, kcpTransport *KCPTransport, kcpReplySproto int, peerModes *PeerModeTracker) {
+func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, recv chan<- *Packet, cryptoConfig *CryptoConfig, fecReceiver *FECReceiver, kcpTransport *KCPTransport, kcpReplySproto int, peerModes *PeerModeTracker, rateLimiter *RateLimiter) {
 
 	defer common.CrashLog()
 
@@ -194,7 +203,7 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, 
 				peerModes.Observe(destKey, PeerModeKCP, 0, 0)
 			}
 			session := kcpTransport.Session(destKey, src, echoId, func(seg []byte) {
-				if err := writeICMP(conn, echoId, 0, kcpReplySproto, src, kcpTransport.BuildPacket(seg)); err != nil {
+				if err := writeICMP(conn, echoId, 0, kcpReplySproto, src, kcpTransport.BuildPacket(seg), rateLimiter); err != nil {
 					loggo.Error("recvICMP kcp write error %s %s", src.String(), err)
 				}
 			})
