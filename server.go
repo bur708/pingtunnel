@@ -492,6 +492,25 @@ func (p *Server) RecvTCP(conn *ServerConn, id string, src *net.IPAddr) {
 	startConnectTime := common.GetNowUpdateInSecond()
 	connectWait := newAdaptiveLoopWait(2*time.Millisecond, 80*time.Millisecond)
 	fecSender, kcpTransport := p.peerTransport(src, conn.echoId)
+	// conn.fm (a network.FrameMgr) already provides this connection's own
+	// reliable, ordered ARQ - its own window, ACKs, and resend timer
+	// (tcpmode_resend_timems, default 400ms) - see the detailed comment
+	// above client.go's AcceptTcpConn (this function's exact counterpart on
+	// the other end of the same tcpmode connection). Wrapping its frames in
+	// KCP as well stacks a second, independent ARQ on top of the first:
+	// once KCP's own retransmission takes longer than FrameMgr's resend
+	// timeout (routine under any real load - see KCPSession's backlog cap
+	// in kcp_transport.go), FrameMgr sees the missing ACK as loss and sends
+	// its own duplicate frame, which itself re-enters KCP as a brand new
+	// message - a resend-amplification feedback loop that saturated the
+	// KCP backlog within seconds under real VPN traffic (live-tested
+	// 2026-08-24) and left the tunnel not working at all, not just slow.
+	// FEC has no such problem (no retry timer of its own, just forward
+	// redundancy) so fecSender is left untouched; only kcpTransport is
+	// nilled here, for every sendICMP call in this function, falling
+	// through to a plain unwrapped send exactly as tcpmode traffic used
+	// before FEC/KCP existed.
+	kcpTransport = nil
 	for !p.exit && !conn.exit {
 		if conn.fm.IsConnected() {
 			break

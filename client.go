@@ -472,10 +472,28 @@ func (p *Client) AcceptTcpConn(conn *net.TCPConn, targetAddr string) {
 			f := e.Value.(*network.Frame)
 			mb, _ := clientConn.fm.MarshalFrame(f)
 			p.sequence++
+			// kcpTransport deliberately passed as nil, not p.kcpTransport: this
+			// connection already has its own reliable, ordered ARQ layer
+			// (clientConn.fm, a network.FrameMgr, with its own resend timer -
+			// tcpmode_resend_timems, default 400ms). Wrapping its frames in KCP
+			// too stacks a second, independent ARQ on top of the first - once
+			// KCP's own retransmission takes longer than FrameMgr's resend
+			// timeout (routine under any real load: see KCPSession's backlog
+			// cap in kcp_transport.go), FrameMgr sees the missing ACK as loss
+			// and sends its own duplicate frame, which itself re-enters KCP as
+			// a brand new message. That's a resend-amplification feedback loop
+			// which saturated the KCP backlog within seconds under real VPN
+			// traffic (live-tested 2026-08-24) - not just slow, the tunnel
+			// stopped working entirely once it hit the cap. FEC has no such
+			// problem (no retry timer of its own, just forward redundancy), so
+			// is left untouched at fecSender; only KCP is skipped, falling
+			// through to a plain unwrapped send exactly as tcpmode traffic used
+			// before FEC/KCP existed. Same reasoning applies everywhere else in
+			// this file and server.go that sends via a *.fm (FrameMgr).
 			sendICMP(p.id, p.sequence, *p.conn, p.ipaddrServer, targetAddr, clientConn.id, (uint32)(MyMsg_DATA), mb,
 				SEND_PROTO, RECV_PROTO, p.key,
 				p.tcpmode, p.tcpmode_buffersize, p.tcpmode_maxwin, p.tcpmode_resend_timems, p.tcpmode_compress, p.tcpmode_stat,
-				p.timeout, p.cryptoConfig, p.fecSender, p.kcpTransport)
+				p.timeout, p.cryptoConfig, p.fecSender, nil)
 			p.sendPacket++
 			p.sendPacketSize += (uint64)(len(mb))
 		}
@@ -575,10 +593,12 @@ mainLoop:
 					continue
 				}
 				p.sequence++
+				// nil kcpTransport: clientConn.fm already provides ARQ - see
+				// the detailed comment above AcceptTcpConn's first sendICMP.
 				sendICMP(p.id, p.sequence, *p.conn, p.ipaddrServer, targetAddr, clientConn.id, (uint32)(MyMsg_DATA), mb,
 					SEND_PROTO, RECV_PROTO, p.key,
 					p.tcpmode, 0, 0, 0, 0, 0,
-					0, p.cryptoConfig, p.fecSender, p.kcpTransport)
+					0, p.cryptoConfig, p.fecSender, nil)
 				p.sendPacket++
 				p.sendPacketSize += (uint64)(len(mb))
 			}
@@ -664,10 +684,12 @@ mainLoop:
 			f := e.Value.(*network.Frame)
 			mb, _ := clientConn.fm.MarshalFrame(f)
 			p.sequence++
+			// nil kcpTransport: clientConn.fm already provides ARQ - see
+			// the detailed comment above AcceptTcpConn's first sendICMP.
 			sendICMP(p.id, p.sequence, *p.conn, p.ipaddrServer, targetAddr, clientConn.id, (uint32)(MyMsg_DATA), mb,
 				SEND_PROTO, RECV_PROTO, p.key,
 				p.tcpmode, 0, 0, 0, 0, 0,
-				0, p.cryptoConfig, p.fecSender, p.kcpTransport)
+				0, p.cryptoConfig, p.fecSender, nil)
 			p.sendPacket++
 			p.sendPacketSize += (uint64)(len(mb))
 		}
