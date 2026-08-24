@@ -216,7 +216,8 @@ func TestKCPTransportDeliversAcrossTwoTransports(t *testing.T) {
 func TestKCPWireFraming(t *testing.T) {
 	macKey := []byte("test-mac-key")
 	segment := []byte{1, 2, 3, 4, 5}
-	pkt := buildKCPPacket(segment, macKey)
+	const flowID uint16 = 42
+	pkt := buildKCPPacket(flowID, segment, macKey)
 
 	if !IsKCPPacket(pkt) {
 		t.Fatalf("expected IsKCPPacket to be true")
@@ -225,15 +226,18 @@ func TestKCPWireFraming(t *testing.T) {
 		t.Fatalf("raw segment without marker should not look like a KCP packet")
 	}
 
-	got, err := ParseKCPPacket(pkt, macKey)
+	gotFlowID, got, err := ParseKCPPacket(pkt, macKey)
 	if err != nil {
 		t.Fatalf("ParseKCPPacket: %v", err)
+	}
+	if gotFlowID != flowID {
+		t.Fatalf("flowID round-trip mismatch: want %d got %d", flowID, gotFlowID)
 	}
 	if !bytes.Equal(got, segment) {
 		t.Fatalf("round-trip mismatch: want %v got %v", segment, got)
 	}
 
-	if _, err := ParseKCPPacket([]byte{}, macKey); err == nil {
+	if _, _, err := ParseKCPPacket([]byte{}, macKey); err == nil {
 		t.Fatalf("expected error parsing an empty packet")
 	}
 }
@@ -244,16 +248,31 @@ func TestKCPWireFraming(t *testing.T) {
 // well-formed version byte and a plausible-looking KCP segment body.
 func TestKCPWireFramingRejectsWrongMacKey(t *testing.T) {
 	segment := []byte{1, 2, 3, 4, 5}
-	pkt := buildKCPPacket(segment, []byte("real-key"))
+	pkt := buildKCPPacket(7, segment, []byte("real-key"))
 
-	if _, err := ParseKCPPacket(pkt, []byte("wrong-key")); err == nil {
+	if _, _, err := ParseKCPPacket(pkt, []byte("wrong-key")); err == nil {
 		t.Fatalf("expected error parsing a packet tagged with a different key")
 	}
 
 	forged := append([]byte(nil), pkt...)
 	forged[len(forged)-1] ^= 0xFF // flip a byte in the segment after tagging
-	if _, err := ParseKCPPacket(forged, []byte("real-key")); err == nil {
+	if _, _, err := ParseKCPPacket(forged, []byte("real-key")); err == nil {
 		t.Fatalf("expected error parsing a tampered segment")
+	}
+}
+
+// Regression test for the head-of-line-blocking fix: tampering with just
+// the flowID byte (leaving the MAC and segment untouched) must also be
+// rejected - otherwise an off-path attacker could redirect a valid segment
+// into a different flow's session by flipping this one field.
+func TestKCPWireFramingRejectsTamperedFlowID(t *testing.T) {
+	macKey := []byte("real-key")
+	pkt := buildKCPPacket(7, []byte{1, 2, 3, 4, 5}, macKey)
+
+	forged := append([]byte(nil), pkt...)
+	forged[1+kcpMacSize] ^= 0xFF // flip a bit in the flowID field only
+	if _, _, err := ParseKCPPacket(forged, macKey); err == nil {
+		t.Fatalf("expected error parsing a packet with a tampered flowID")
 	}
 }
 
@@ -353,4 +372,177 @@ func TestKCPSessionSendDoesNotSpuriouslyDropOnHealthyLink(t *testing.T) {
 
 	got := collectMessages(t, b, n, 10*time.Second)
 	assertMessagesEqual(t, want, got)
+}
+
+// Regression test for the head-of-line-blocking fix: before this, every
+// non-tcpmode packet a peer sent - PING, KICK, and critically every
+// independent SOCKS5-UDP-relay flow (every DNS lookup a browser makes) -
+// shared exactly one KCP session, since sendICMP/recvICMP's destKey was
+// only (peer address, ICMP echo id), constant per peer. KCP's in-order
+// delivery meant one stuck flow blocked every other flow multiplexed onto
+// it. kcpFlowID gives each connId its own slot in the destKey instead.
+func TestKCPFlowIDBucketing(t *testing.T) {
+	// Same connId must always map to the same flow id, or the two ends of
+	// one flow's traffic would land on different KCP sessions and never
+	// converge.
+	first := kcpFlowID("conn-uuid-aaaa")
+	if got := kcpFlowID("conn-uuid-aaaa"); got != first {
+		t.Fatalf("kcpFlowID not stable across calls: got %d and %d for the same connId", got, first)
+	}
+
+	// PING/KICK-before-a-real-connId-exists (connId == "") get the
+	// reserved control bucket, kept out of the range real flows hash into.
+	if got := kcpFlowID(""); got != kcpControlFlowID {
+		t.Fatalf("expected kcpFlowID(\"\") == kcpControlFlowID (%d), got %d", kcpControlFlowID, got)
+	}
+
+	// With a fixed bucket pool (kcpFlowBuckets), any two arbitrary connIds
+	// may legitimately collide onto the same bucket - that's the accepted
+	// tradeoff (see kcpFlowID's doc comment), not something to assert
+	// against for any single pair. What must hold is: every real connId
+	// stays out of the reserved control bucket, every id stays in range,
+	// and a large enough set of distinct connIds actually spreads across
+	// more than one bucket (i.e. this isn't secretly collapsing everything
+	// onto one id).
+	seen := map[uint16]bool{}
+	for i := 0; i < 500; i++ {
+		id := kcpFlowID(fmt.Sprintf("conn-uuid-%d", i))
+		if id == kcpControlFlowID {
+			t.Fatalf("real connId %q hashed onto the reserved control bucket", fmt.Sprintf("conn-uuid-%d", i))
+		}
+		if id >= kcpFlowBuckets {
+			t.Fatalf("flow id %d out of range [0, %d)", id, kcpFlowBuckets)
+		}
+		seen[id] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("500 distinct connIds all hashed onto a single bucket - kcpFlowID isn't actually distributing flows")
+	}
+}
+
+// Companion to TestKCPFlowIDBucketing at the KCPTransport level: two flows
+// to the same peer that land in different buckets (same destKey prefix,
+// different flowID-derived suffix, matching how pingtunnel.go builds
+// destKey) must get independent sessions - i.e. one being completely
+// stalled cannot prevent the other from being created and used. With a
+// fixed bucket pool any two arbitrary connIds might collide onto the same
+// bucket (an accepted tradeoff - see kcpFlowID), so this scans a small set
+// for a pair that doesn't, rather than asserting it of any two fixed
+// names.
+func TestKCPTransportSeparateFlowsGetIndependentSessions(t *testing.T) {
+	transport := NewKCPTransport(fastTestKCPConfig(), nil, nil)
+	defer transport.Close()
+
+	peer := "1.2.3.4"
+	echoId := 100
+
+	var flowA, flowB uint16
+	for i := 0; ; i++ {
+		if i > kcpFlowBuckets*4 {
+			t.Fatal("could not find two connIds landing in different buckets - kcpFlowID may be broken")
+		}
+		flowA = kcpFlowID(fmt.Sprintf("scan-flow-%d", i))
+		flowB = kcpFlowID(fmt.Sprintf("scan-flow-%d", i+1))
+		if flowA != flowB {
+			break
+		}
+	}
+
+	keyA := fmt.Sprintf("%s|%d|%d", peer, echoId, flowA)
+	keyB := fmt.Sprintf("%s|%d|%d", peer, echoId, flowB)
+
+	// flowA's session is a black hole - simulates a stuck/lossy lookup
+	// that, pre-fix, would have head-of-line-blocked flowB behind it.
+	sessionA := transport.Session(keyA, nil, echoId, func(segment []byte) {})
+	sessionB := transport.Session(keyB, nil, echoId, func(segment []byte) {})
+
+	if sessionA == sessionB {
+		t.Fatal("expected independent sessions for independent flows to the same peer")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- sessionB.Send([]byte("this must not wait behind flow A")) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("flow B's Send failed: %v", err)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("flow B's Send blocked - it appears to be sharing state with flow A's stalled session")
+	}
+}
+
+// Regression test for the per-flow session leak: per-flow sessions (see
+// TestKCPFlowIDSeparatesIndependentFlows) are created far more often than
+// the old one-per-peer scheme - one per DNS lookup - and each holds a
+// goroutine ticking every Interval ms until Close'd, so leaving every one
+// of them running forever over a long browsing session is a real leak, not
+// a theoretical one. Drives reapIdle directly (rather than waiting out the
+// real kcpSessionIdleTimeout) by backdating a session's activity clock.
+func TestKCPTransportReapsIdleSessions(t *testing.T) {
+	transport := NewKCPTransport(fastTestKCPConfig(), nil, nil)
+	defer transport.Close()
+
+	idle := transport.Session("idle-flow", nil, 0, func(segment []byte) {})
+	fresh := transport.Session("fresh-flow", nil, 0, func(segment []byte) {})
+
+	idle.lastActivityUnixNano.Store(time.Now().Add(-2 * kcpSessionIdleTimeout).UnixNano())
+
+	transport.reapIdle()
+
+	transport.mu.Lock()
+	_, idleStillTracked := transport.sessions["idle-flow"]
+	_, freshStillTracked := transport.sessions["fresh-flow"]
+	transport.mu.Unlock()
+
+	if idleStillTracked {
+		t.Fatal("expected the idle session to be reaped")
+	}
+	if !freshStillTracked {
+		t.Fatal("expected the recently-active session to survive reaping")
+	}
+
+	select {
+	case <-idle.Done():
+	default:
+		t.Fatal("expected the reaped session to be Close'd (Done channel closed)")
+	}
+	select {
+	case <-fresh.Done():
+		t.Fatal("expected the surviving session to still be open")
+	default:
+	}
+}
+
+// Regression test for the resource-overhead problem found live-testing the
+// first (unbounded, one session per connId) version of this fix 2026-08-24:
+// a phone's background apps alone sustain on the order of 170-185
+// concurrent SOCKS5-UDP-relay flows (mostly DNS), and with one KCPSession
+// per flow each running its own 20ms-interval goroutine, that's ~8500
+// ticks/sec of pure idle-session bookkeeping - a real, measured CPU cost.
+// Bucketing (kcpFlowID) must keep the number of live sessions for a peer
+// bounded by kcpFlowBuckets, however many distinct flows are actually
+// multiplexed onto it.
+func TestKCPTransportSessionCountBoundedByFlowBuckets(t *testing.T) {
+	transport := NewKCPTransport(fastTestKCPConfig(), nil, nil)
+	defer transport.Close()
+
+	peer := "5.6.7.8"
+	echoId := 200
+	const simulatedFlows = 500 // comfortably more than a real phone's peak
+
+	for i := 0; i < simulatedFlows; i++ {
+		flowID := kcpFlowID(fmt.Sprintf("flow-%d", i))
+		key := fmt.Sprintf("%s|%d|%d", peer, echoId, flowID)
+		transport.Session(key, nil, echoId, func(segment []byte) {})
+	}
+
+	transport.mu.Lock()
+	sessionCount := len(transport.sessions)
+	transport.mu.Unlock()
+
+	if sessionCount > kcpFlowBuckets {
+		t.Fatalf("%d simulated flows produced %d live sessions, want at most kcpFlowBuckets (%d)", simulatedFlows, sessionCount, kcpFlowBuckets)
+	}
 }

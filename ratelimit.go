@@ -6,14 +6,28 @@ import (
 )
 
 // DefaultMaxPPS is the outbound packet-rate cap used when -max-pps isn't
-// set (or is <= 0). Chosen from live measurements against a real
-// residential Wi-Fi link (2026-08-24): raw ICMP floods stayed under ~1%
-// loss and low RTT up to ~70-100pps once the link was "warm", but a cold
-// burst at 100pps saw 8.5% loss and RTT spiking to 477ms. 400 is well above
-// the clean steady-state zone (this is a safety net against runaway
-// amplification, not a throughput tune) but far below the 3000+pps the
-// tunnel reached during the observed resend storm.
-const DefaultMaxPPS = 400
+// set (or is <= 0). Originally set to 400 from live measurements against a
+// real residential Wi-Fi link (2026-08-24): raw ICMP floods stayed under
+// ~1% loss and low RTT up to ~70-100pps once the link was "warm", but a
+// cold burst at 100pps saw 8.5% loss and RTT spiking to 477ms - 400 was
+// meant purely as a safety net against runaway amplification, not a
+// throughput tune, and far below the 3000+pps the tunnel reached during
+// the resend storm that motivated adding this limiter at all.
+//
+// Raised to 2000 the same day once that safety net turned out to have a
+// real cost of its own: a phone's background apps alone sustain on the
+// order of 170-185 concurrent SOCKS5-UDP-relay flows (mostly DNS), all
+// sharing this one budget. At 400pps that's only ~2pps per flow on
+// average, and -kcp needs more round trips per exchange (data + ACK
+// segments) than -fec/none's one-packet-each-way, so KCP flows were the
+// first to fall behind their local proxy's own reply timeout under that
+// contention - observed live as ERR_NAME_NOT_RESOLVED in the browser even
+// though the tunnel itself was healthy (no drops, no crash, steady
+// resource use). The resend-storm risk this limiter exists to cap is
+// itself now bounded by other means too (KCP's own backpressure in
+// kcp_transport.go, per-flow session bucketing there), so raising the
+// ceiling is safer than it would have been when 400 was first chosen.
+const DefaultMaxPPS = 2000
 
 // RateLimiter caps a Client/Server instance's total outbound packet rate,
 // shared across every connection multiplexed onto its one ICMP socket -

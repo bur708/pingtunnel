@@ -60,9 +60,13 @@ func sendICMP(id int, sequence int, conn icmp.PacketConn, server *net.IPAddr, ta
 	// seq as load-bearing (only echoId is), and a KCP session's own
 	// flushes aren't tied 1:1 to external sendICMP calls anyway.
 	if kcpTransport != nil {
-		destKey := fmt.Sprintf("%s|%d", server.String(), id)
+		// flowID keeps independent flows (e.g. two unrelated DNS lookups)
+		// off the same KCP session so one slow/lossy flow can't head-of-
+		// line-block another - see kcpFlowID's doc comment.
+		flowID := kcpFlowID(connId)
+		destKey := fmt.Sprintf("%s|%d|%d", server.String(), id, flowID)
 		session := kcpTransport.Session(destKey, server, id, func(segment []byte) {
-			if err := writeICMP(conn, id, 0, sproto, server, kcpTransport.BuildPacket(segment), rateLimiter); err != nil {
+			if err := writeICMP(conn, id, 0, sproto, server, kcpTransport.BuildPacket(flowID, segment), rateLimiter); err != nil {
 				loggo.Error("sendICMP kcp write error %s %s", server.String(), err)
 			}
 		})
@@ -188,22 +192,28 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, 
 		}
 
 		if kcpTransport != nil && IsKCPPacket(payloadData) {
-			segment, err := kcpTransport.ParsePacket(payloadData)
+			flowID, segment, err := kcpTransport.ParsePacket(payloadData)
 			if err != nil {
 				loggo.Debug("recvICMP kcp header parse error: %s", err)
 				continue
 			}
-			// Must match sendICMP's destKey formula exactly (peer address
-			// + the client's own echoId, from either side's point of
-			// view) so both directions of one peer's traffic land on the
-			// very same KCPSession - see KCPTransport's doc comment for
-			// why that's required, not just convenient.
-			destKey := fmt.Sprintf("%s|%d", src.String(), echoId)
+			// peerKey is peer-level (no flowID): PeerModeTracker decides,
+			// per peer, which reliability mode to reply in - that's a
+			// coarser question than which KCP session a given flow's
+			// bytes belong to, so it deliberately doesn't get flowID
+			// folded in the way sessionKey below does.
+			peerKey := fmt.Sprintf("%s|%d", src.String(), echoId)
 			if peerModes != nil {
-				peerModes.Observe(destKey, PeerModeKCP, 0, 0)
+				peerModes.Observe(peerKey, PeerModeKCP, 0, 0)
 			}
-			session := kcpTransport.Session(destKey, src, echoId, func(seg []byte) {
-				if err := writeICMP(conn, echoId, 0, kcpReplySproto, src, kcpTransport.BuildPacket(seg), rateLimiter); err != nil {
+			// sessionKey must match sendICMP's destKey formula exactly
+			// (peer address + the client's own echoId + flowID, from
+			// either side's point of view) so both directions of one
+			// flow's traffic land on the very same KCPSession - see
+			// KCPTransport's and kcpFlowID's doc comments for why.
+			sessionKey := fmt.Sprintf("%s|%d|%d", src.String(), echoId, flowID)
+			session := kcpTransport.Session(sessionKey, src, echoId, func(seg []byte) {
+				if err := writeICMP(conn, echoId, 0, kcpReplySproto, src, kcpTransport.BuildPacket(flowID, seg), rateLimiter); err != nil {
 					loggo.Error("recvICMP kcp write error %s %s", src.String(), err)
 				}
 			})

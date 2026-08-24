@@ -3,9 +3,12 @@ package pingtunnel
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	kcp "github.com/xtaci/kcp-go"
@@ -16,25 +19,78 @@ import (
 // scheme so recvICMP can tell legacy / FEC / KCP packets apart from byte 0
 // alone, before parsing further.
 //
-//	[0]    version/flag byte, always KCPVersion for a valid KCP packet
-//	[1:9]  truncated HMAC-SHA256(macKey, segment)
-//	[9:]   raw kcp.KCP segment bytes, passed to (*KCPSession).Input as-is
+//	[0]     version/flag byte, always KCPVersion for a valid KCP packet
+//	[1:9]   truncated HMAC-SHA256(macKey, flowID||segment)
+//	[9:11]  flowID, big-endian uint16 - see kcpFlowID's doc comment
+//	[11:]   raw kcp.KCP segment bytes, passed to (*KCPSession).Input as-is
 //
 // The MAC exists because kcp.KCP's Input() has no authentication of its
-// own: routing to a session is keyed only by (source IP, ICMP echo id),
-// both attacker-observable/spoofable, and the "conv" field kcp-go uses to
-// disambiguate conversations is a fixed constant here (see kcpConv below),
-// not a secret. Without a MAC, an off-path attacker could forge segments
-// (e.g. an ACK claiming already-sent data was delivered) directly into an
-// established session's retransmit bookkeeping. Tying the tag to the same
-// key material that already gates the tunnel (the encryption key, or the
-// fallback numeric -key) means forging a valid segment requires knowing
+// own: routing to a session is keyed only by (source IP, ICMP echo id,
+// flowID), all attacker-observable/spoofable, and the "conv" field kcp-go
+// uses to disambiguate conversations is a fixed constant here (see kcpConv
+// below), not a secret. Without a MAC, an off-path attacker could forge
+// segments (e.g. an ACK claiming already-sent data was delivered) directly
+// into an established session's retransmit bookkeeping, or redirect a
+// segment into the wrong flow's session by tampering with flowID - which is
+// why the MAC covers flowID too, not just the segment. Tying the tag to the
+// same key material that already gates the tunnel (the encryption key, or
+// the fallback numeric -key) means forging a valid segment requires knowing
 // that secret, same as everywhere else in this protocol.
 const (
 	KCPVersion    byte = 2
 	kcpMacSize         = 8
-	KCPHeaderSize      = 1 + kcpMacSize
+	kcpFlowIDSize      = 2
+	KCPHeaderSize      = 1 + kcpMacSize + kcpFlowIDSize
 )
+
+// kcpFlowID hashes connId (the same UUID sendICMP/recvICMP already thread
+// through as the MyMsg.Id for this packet) into one of a fixed pool of
+// kcpFlowBuckets session slots. Two problems, found in that order live-
+// testing 2026-08-24, shaped this design:
+//
+//  1. Originally every non-tcpmode packet a peer sent - PING, KICK, and
+//     critically every independent SOCKS5-UDP-relay flow, including every
+//     DNS lookup a browser makes - shared exactly one KCP session (keyed
+//     only by source address + ICMP echo id, both constant per peer). KCP
+//     guarantees in-order delivery within a session, so one lost/slow-to-
+//     retransmit flow head-of-line-blocked every other flow multiplexed
+//     onto that session behind it: a single stuck DNS lookup stalled every
+//     subsequent lookup (any new site/video), while already-established
+//     connections (no fresh lookup needed) kept working - exactly what
+//     pointed here.
+//  2. The first fix for (1) gave every connId its own session outright (no
+//     bucketing). That traded head-of-line blocking for a different real
+//     cost: a phone's background apps alone sustain on the order of 170-185
+//     concurrent SOCKS5-UDP-relay flows (measured live, mostly DNS,
+//     mostly unrelated to whatever page the user is actively loading), and
+//     each KCPSession runs its own goroutine ticking every Interval ms
+//     (20ms default) until closed - that's ~8500 ticks/sec of pure
+//     bookkeeping overhead just from idle-session upkeep, enough to show
+//     up as sustained CPU load competing with the traffic it's supposed to
+//     be moving.
+//
+// Bucketing bounds the session count to kcpFlowBuckets regardless of how
+// many concurrent flows exist, while still keeping any one stuck flow's
+// head-of-line blocking radius to roughly 1/kcpFlowBuckets of all flows
+// instead of all of them - not a perfect fix for (1), but a real, bounded
+// improvement that also fixes (2). connId == "" (PING, and KICK before a
+// connection with a real id exists) maps to a fixed reserved bucket, kept
+// out of the hashed range so control traffic never shares a session with -
+// or gets head-of-line-blocked by - a real flow.
+const (
+	kcpControlFlowID uint16 = 0
+	kcpFlowBuckets          = 32
+)
+
+func kcpFlowID(connId string) uint16 {
+	if connId == "" {
+		return kcpControlFlowID
+	}
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(connId))
+	// +1 keeps real flows out of bucket 0, reserved for control traffic.
+	return uint16(1 + h.Sum32()%(kcpFlowBuckets-1))
+}
 
 // kcpConv is the KCP "conversation id" every session on both sides uses.
 // kcp.KCP.Input rejects any segment whose conv does not match, but our own
@@ -67,39 +123,49 @@ func deriveKCPMacKey(cryptoConfig *CryptoConfig, key int) []byte {
 	return h.Sum(nil)
 }
 
-// kcpTag computes the truncated HMAC-SHA256 tag for segment under macKey.
-func kcpTag(macKey, segment []byte) []byte {
+// kcpTag computes the truncated HMAC-SHA256 tag for (flowID, segment) under
+// macKey. Covering flowID (not just segment) stops an off-path attacker
+// from redirecting an otherwise-valid segment into a different flow's
+// session by tampering with the flowID byte alone.
+func kcpTag(macKey []byte, flowID uint16, segment []byte) []byte {
 	mac := hmac.New(sha256.New, macKey)
+	var flowIDBytes [kcpFlowIDSize]byte
+	binary.BigEndian.PutUint16(flowIDBytes[:], flowID)
+	mac.Write(flowIDBytes[:])
 	mac.Write(segment)
 	return mac.Sum(nil)[:kcpMacSize]
 }
 
-// buildKCPPacket prepends the KCP marker byte and an HMAC tag (keyed by
-// macKey) to a raw segment produced by a kcp.KCP engine's output callback.
-func buildKCPPacket(segment []byte, macKey []byte) []byte {
+// buildKCPPacket prepends the KCP marker byte, an HMAC tag (keyed by
+// macKey), and flowID to a raw segment produced by a kcp.KCP engine's
+// output callback. See kcpFlowID's doc comment for what flowID is for.
+func buildKCPPacket(flowID uint16, segment []byte, macKey []byte) []byte {
 	out := make([]byte, KCPHeaderSize+len(segment))
 	out[0] = KCPVersion
-	copy(out[1:KCPHeaderSize], kcpTag(macKey, segment))
+	copy(out[1:1+kcpMacSize], kcpTag(macKey, flowID, segment))
+	binary.BigEndian.PutUint16(out[1+kcpMacSize:KCPHeaderSize], flowID)
 	copy(out[KCPHeaderSize:], segment)
 	return out
 }
 
 // ParseKCPPacket verifies the HMAC tag (keyed by macKey) and strips the
-// header, returning the raw segment bytes ready for (*KCPSession).Input.
-// A missing/wrong-key/forged tag is indistinguishable from network
-// corruption from the caller's point of view - both are just dropped.
-func ParseKCPPacket(b []byte, macKey []byte) ([]byte, error) {
+// header, returning the flowID and raw segment bytes ready for
+// (*KCPSession).Input. A missing/wrong-key/forged tag is indistinguishable
+// from network corruption from the caller's point of view - both are just
+// dropped.
+func ParseKCPPacket(b []byte, macKey []byte) (uint16, []byte, error) {
 	if len(b) < KCPHeaderSize {
-		return nil, fmt.Errorf("kcp: packet too short for header: %d bytes", len(b))
+		return 0, nil, fmt.Errorf("kcp: packet too short for header: %d bytes", len(b))
 	}
 	if b[0] != KCPVersion {
-		return nil, fmt.Errorf("kcp: unsupported version byte %d", b[0])
+		return 0, nil, fmt.Errorf("kcp: unsupported version byte %d", b[0])
 	}
+	flowID := binary.BigEndian.Uint16(b[1+kcpMacSize : KCPHeaderSize])
 	segment := b[KCPHeaderSize:]
-	if !hmac.Equal(b[1:KCPHeaderSize], kcpTag(macKey, segment)) {
-		return nil, fmt.Errorf("kcp: invalid packet tag")
+	if !hmac.Equal(b[1:1+kcpMacSize], kcpTag(macKey, flowID, segment)) {
+		return 0, nil, fmt.Errorf("kcp: invalid packet tag")
 	}
-	return segment, nil
+	return flowID, segment, nil
 }
 
 // KCPConfig tunes the underlying KCP engine. Defaults roughly match kcp-go's
@@ -193,6 +259,19 @@ type KCPSession struct {
 
 	maxWaitSnd          int
 	backpressureTimeout time.Duration
+
+	// lastActivityUnixNano is touched on every Send/Input, read by
+	// KCPTransport's idle reaper - see kcpSessionIdleTimeout.
+	lastActivityUnixNano atomic.Int64
+}
+
+// lastActivity returns when this session last saw Send or Input activity.
+func (s *KCPSession) lastActivity() time.Time {
+	return time.Unix(0, s.lastActivityUnixNano.Load())
+}
+
+func (s *KCPSession) touchActivity() {
+	s.lastActivityUnixNano.Store(time.Now().UnixNano())
 }
 
 // NewKCPSession creates a session and starts its background update loop.
@@ -206,6 +285,7 @@ func NewKCPSession(cfg *KCPConfig, sendRaw func(segment []byte)) *KCPSession {
 		recv: make(chan []byte, 1024),
 		exit: make(chan struct{}),
 	}
+	s.touchActivity()
 
 	s.engine = kcp.NewKCP(kcpConv, func(buf []byte, size int) {
 		cp := make([]byte, size)
@@ -303,6 +383,8 @@ func (s *KCPSession) deliver(msgs [][]byte) {
 // without bound, since neither kcp.KCP.Send nor NoCongestion=1 imposes any
 // cap of their own - see MaxWaitSnd's doc comment.
 func (s *KCPSession) Send(msg []byte) error {
+	s.touchActivity()
+
 	if err := s.waitForRoom(); err != nil {
 		return err
 	}
@@ -350,6 +432,8 @@ func (s *KCPSession) waitForRoom() error {
 // messages to RecvChan immediately rather than waiting for the next
 // update tick.
 func (s *KCPSession) Input(pkt []byte) {
+	s.touchActivity()
+
 	s.mu.Lock()
 	s.engine.Input(pkt, true, false)
 	msgs := s.drainLocked()
@@ -377,15 +461,15 @@ func (s *KCPSession) Done() <-chan struct{} {
 	return s.exit
 }
 
-// KCPTransport manages one KCPSession per destination (peer), the same
-// destKey granularity fec.go's FECSender/FECReceiver already use (one
-// session per (remote address, ICMP echo id) pair). A single transport is
-// shared for both directions of traffic to a given peer - sendICMP and
-// recvICMP both call Session for the same destKey, and whichever happens
-// first creates it; KCP is bidirectional within one engine, so outbound
-// application data and inbound ACKs (and vice versa) must flow through
-// the very same *kcp.KCP or its retransmit/ack bookkeeping never
-// converges.
+// KCPTransport manages one KCPSession per (destination, flow) - destKey
+// already folds in kcpFlowID (see its doc comment for why per-flow, not
+// just per-peer, matters: head-of-line blocking between unrelated flows
+// multiplexed onto one session). A single transport is shared for both
+// directions of traffic to a given peer - sendICMP and recvICMP both call
+// Session for the same destKey, and whichever happens first creates it;
+// KCP is bidirectional within one engine, so outbound application data and
+// inbound ACKs (and vice versa) must flow through the very same *kcp.KCP
+// or its retransmit/ack bookkeeping never converges.
 type KCPTransport struct {
 	cfg *KCPConfig
 	// macKey authenticates every KCP segment on the wire (see KCPHeaderSize's
@@ -401,28 +485,85 @@ type KCPTransport struct {
 
 	mu       sync.Mutex
 	sessions map[string]*KCPSession
+
+	reaperStop chan struct{}
+	reaperDone chan struct{}
 }
 
+// kcpSessionIdleTimeout bounds how long an idle (no Send/Input activity)
+// session is kept before Reap closes and drops it. Per-flow sessions (see
+// kcpFlowID) are created far more often than the old one-per-peer scheme -
+// e.g. one per DNS lookup - and each holds a goroutine ticking every
+// Interval ms (default 20ms) until closed, so leaving them all running
+// forever is a real, not just theoretical, goroutine/memory leak over a
+// long browsing session. 30s comfortably outlives a single lookup's
+// request/response round trip while still reclaiming promptly.
+const kcpSessionIdleTimeout = 30 * time.Second
+
+// kcpReapInterval is how often KCPTransport scans for idle sessions to
+// close - doesn't need to be frequent, idle sessions are cheap to leave
+// around for up to one extra interval past their timeout.
+const kcpReapInterval = 10 * time.Second
+
 // NewKCPTransport creates an (initially empty) per-destination session
-// manager for the given tuning parameters. deliver may be nil if the
+// manager for the given tuning parameters, and starts its background idle-
+// session reaper (see kcpSessionIdleTimeout). deliver may be nil if the
 // caller only ever sends (never expects inbound application data on these
 // sessions) - not a realistic pingtunnel setup, but convenient for tests.
 func NewKCPTransport(cfg *KCPConfig, macKey []byte, deliver func(msg []byte, peer *net.IPAddr, id int)) *KCPTransport {
 	if cfg == nil {
 		cfg = DefaultKCPConfig()
 	}
-	return &KCPTransport{cfg: cfg, macKey: macKey, deliver: deliver, sessions: make(map[string]*KCPSession)}
+	t := &KCPTransport{
+		cfg: cfg, macKey: macKey, deliver: deliver,
+		sessions:   make(map[string]*KCPSession),
+		reaperStop: make(chan struct{}),
+		reaperDone: make(chan struct{}),
+	}
+	go t.reapLoop()
+	return t
+}
+
+func (t *KCPTransport) reapLoop() {
+	defer close(t.reaperDone)
+	ticker := time.NewTicker(kcpReapInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.reaperStop:
+			return
+		case <-ticker.C:
+			t.reapIdle()
+		}
+	}
+}
+
+func (t *KCPTransport) reapIdle() {
+	now := time.Now()
+	t.mu.Lock()
+	var idle []*KCPSession
+	for destKey, s := range t.sessions {
+		if now.Sub(s.lastActivity()) >= kcpSessionIdleTimeout {
+			idle = append(idle, s)
+			delete(t.sessions, destKey)
+		}
+	}
+	t.mu.Unlock()
+
+	for _, s := range idle {
+		s.Close()
+	}
 }
 
 // BuildPacket frames a raw segment for the wire, tagged with this
-// transport's macKey.
-func (t *KCPTransport) BuildPacket(segment []byte) []byte {
-	return buildKCPPacket(segment, t.macKey)
+// transport's macKey and flowID.
+func (t *KCPTransport) BuildPacket(flowID uint16, segment []byte) []byte {
+	return buildKCPPacket(flowID, segment, t.macKey)
 }
 
 // ParsePacket verifies and strips a wire-framed packet's header, using this
-// transport's macKey.
-func (t *KCPTransport) ParsePacket(b []byte) ([]byte, error) {
+// transport's macKey, returning the flowID it was tagged with.
+func (t *KCPTransport) ParsePacket(b []byte) (uint16, []byte, error) {
 	return ParseKCPPacket(b, t.macKey)
 }
 
@@ -430,8 +571,9 @@ func (t *KCPTransport) ParsePacket(b []byte) ([]byte, error) {
 // starting a goroutine that feeds every message it ever receives to
 // t.deliver) if none exists yet. peer/id are only used to tag messages
 // handed to deliver - both sendICMP and recvICMP already compute the same
-// destKey for a given peer, so whichever of them creates the session
-// passes the peer/id that later drives every deliver call for it.
+// destKey (peer + ICMP echo id + kcpFlowID) for a given flow, so whichever
+// of them creates the session passes the peer/id that later drives every
+// deliver call for it.
 func (t *KCPTransport) Session(destKey string, peer *net.IPAddr, id int, sendRaw func(segment []byte)) *KCPSession {
 	t.mu.Lock()
 	if s, ok := t.sessions[destKey]; ok {
@@ -458,8 +600,11 @@ func (t *KCPTransport) Session(destKey string, peer *net.IPAddr, id int, sendRaw
 	return s
 }
 
-// Close shuts down every tracked session.
+// Close shuts down every tracked session and stops the idle-session reaper.
 func (t *KCPTransport) Close() {
+	close(t.reaperStop)
+	<-t.reaperDone
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for _, s := range t.sessions {
