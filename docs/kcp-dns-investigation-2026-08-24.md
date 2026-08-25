@@ -1,9 +1,12 @@
 # KCP / real-world DNS reliability investigation — 2026-08-24
 
-Status: **3 real bugs found, fixed, and verified. 1 issue remains open** (KCP
-mode + real Android VPN traffic still intermittently fails DNS resolution
-in the browser). This doc is a handoff for continuing that investigation,
-written so a fresh session/tool with no prior context can pick it up.
+Status: **3 real bugs found, fixed, and verified. A 4th issue (KCP mode +
+real Android VPN traffic intermittently failing DNS resolution) was open
+for a full separate investigation session; its root cause is now
+experimentally confirmed — see "2026-08-25 — ROOT CAUSE CONFIRMED" near
+the end of this doc. A permanent fix has not yet been implemented.** This
+doc is a handoff for continuing that investigation, written so a fresh
+session/tool with no prior context can pick it up.
 
 ## TL;DR for a fresh investigator
 
@@ -417,3 +420,188 @@ ssh aspire "rm -rf /tmp/pingtunnel-push"
    matters most in a real VPN workload — a real product tradeoff to weigh,
    not a pure code fix, but the fastest path to "it just works" if (1)-(4)
    don't turn up a cleaner root cause first.
+
+## 2026-08-25 — ROOT CAUSE CONFIRMED: Linux kernel ICMP Echo Reply reflection
+
+A separate investigation session (different tooling, isolated diagnostic
+build, not the production server/client) picked up the PING/PONG loss lead
+above and ran it to a confirmed, experimentally-verified root cause. This
+section is written to the same "no prior context needed" standard as the
+rest of this doc. **Read this whole section before touching any KCP code**
+— it fully explains the PING/PONG loss table above and, most likely, the
+`ERR_NAME_NOT_RESOLVED` symptom this doc opened with.
+
+### What was proven, and how
+
+Testing was done with two Go CLI instances of this project's own binary
+(`-type server` / `-type client -kcp -sock5 1`) placed in two separate
+Linux network namespaces connected by a single veth pair (`10.200.0.1`
+server / `10.200.0.2` client) — chosen specifically to rule out same-host
+raw-ICMP-socket self-reflection (a different, already-known effect; see
+"Explicitly ruled out" below) while still being a real, if minimal,
+two-host network path.
+
+**1. Byte-level capture at the `conn.WriteTo()`/`conn.ReadFrom()` boundary**
+(temporary, one-shot logging added to `writeICMP`/`recvICMP`, not part of
+any permanent build) caught this on the **client**:
+
+```
+CLIENT WRITE   dst=10.200.0.1  len=128  ICMP Type=8  ts=1787686722223559526
+CLIENT READ    src=10.200.0.1  len=128  ICMP Type=0  ts=1787686722223647209   (Δ ≈ 88 µs)
+```
+
+Bytes from the ICMP ID/sequence field onward — i.e. the **entire payload**
+— were identical between the write and the read. Only the ICMP Type byte
+(`0x08`→`0x00`) and the checksum (which necessarily changes when the type
+byte does) differed. This is the exact signature of a standard **Linux
+kernel automatic ICMP Echo Reply**: any host/namespace that receives an
+Echo Request addressed to itself replies at the kernel/IP-stack level,
+verbatim-copying the request's data, before any userspace process — including
+this project's own server — ever sees it. This is controlled by the
+(per-network-namespace) sysctl `net.ipv4.icmp_echo_ignore_all`, which was
+confirmed to read `0` (the Linux default — kernel auto-replies enabled) in
+the test server's namespace.
+
+**2. The server independently, genuinely received the same request.** The
+server's own `CAPTURE_READ` showed `src=10.200.0.2 len=128`, byte-identical
+to the client's write, and its own diagnostic logging
+(`diagIsDNS`/`diagDNS` instrumentation already in `pingtunnel.go`/
+`diagnostic_trace.go`) showed a correct `deliverPayload` decode ~116 µs
+after the client's send — a real, separate, correct delivery via the
+normal wire path, unrelated to the kernel's own reply.
+
+**3. The server sent a real reply, which really did reach the client's raw
+socket.** The server's `CAPTURE_WRITE` for its response (a real 45-byte DNS
+answer, KCP-wrapped, 168 bytes on the wire) was byte-for-byte identical to
+what the client's `CAPTURE_READ` subsequently captured. **The real response
+physically arrives.** It is not lost in transit.
+
+**4. Why it never reached the application layer — the KCP mechanism:**
+- The kernel-generated Echo Reply contains an exact copy of the client's
+  own first KCP segment for that session, including a valid HMAC (it's a
+  literal copy of a correctly-signed packet the client itself produced)
+  and a session key that resolves to the same `KCPSession` the client used
+  to send it (`kcpTransport`'s destKey/sessionKey routing, see
+  `kcp_transport.go`).
+- That segment's sequence number is `sn=0` (it's the very first segment
+  this brand-new session ever sent). A brand-new session's `rcv_nxt` also
+  starts at `0`.
+- `kcp.KCP.Input()` (vendored `github.com/xtaci/kcp-go`) accepts a `PUSH`
+  segment as new data whenever `sn >= rcv_nxt`. `0 >= 0` is true, so the
+  client accepts its own reflected segment as if it were real inbound
+  data, reassembles/delivers it (this is the spurious client-side
+  `deliverPayload` event that started this half of the investigation), and
+  **advances `rcv_nxt` to 1**.
+- The real server response also starts its own independent send-sequence
+  at `sn=0` for this session (it's that direction's first-ever segment
+  too). By the time it arrives, the client's `rcv_nxt` has already moved
+  to `1`, so `kcp.KCP.Input()` treats the real response's `sn=0` as a stale
+  duplicate and never surfaces it — even though it was correctly received
+  at the socket level (see point 3).
+- **Net effect**: every brand-new KCP session's first exchange is corrupted
+  by this mechanism, silently dropping the real reply while producing no
+  error anywhere (no write error, no KCP error — `kcp.KCP.Input()`'s
+  duplicate-suppression is working exactly as designed, just on bad
+  input). This matches the PING/PONG table earlier in this doc — PING
+  reuses one long-lived session (bucket 0) whose very first exchange would
+  have hit this same corruption at client startup, after which every
+  subsequent legitimate reply keeps landing on a `rcv_nxt` that's
+  permanently one ahead of what the server will ever send, since the
+  server's own `snd_nxt` for that session was never advanced by anything
+  the client fabricated.
+
+### Explicitly ruled out (do not re-investigate these for this symptom)
+
+- **Local KCP loopback** — read the vendored `kcp-go` source directly:
+  `KCP.Send()`/`Update()`/`flush()` only ever enqueue data and invoke the
+  registered `Output` callback outward; nothing in the library or in this
+  project's `Output`/`sendRaw` wrapper (`kcp_transport.go`,
+  `pingtunnel.go`) can invoke `Input()` locally. Confirmed by direct source
+  reading, not inference.
+- **Same-host userspace self-reflection** (the `95dfbac` mechanism, where a
+  server's own reply loops back into its own socket because client and
+  server share one host's loopback interface) — this is a **different**
+  effect from the one described here, already fixed for the case it
+  covers, and was explicitly excluded from this investigation by testing
+  across genuinely separate network namespaces connected by a veth pair
+  (not shared loopback).
+- **Lock contention / `KCPSession.mu` / `Update()`-`Output()`-`writeICMP()`
+  latency** — this was the leading hypothesis for a large part of this
+  investigation session and was never confirmed; it is **not** the cause
+  of the symptom described here and should not be revisited for this
+  specific PING/DNS-loss symptom unless new evidence specifically points
+  back to it.
+- **A DNS-specific alternate `deliverPayload` code path** — checked
+  directly: `deliverPayload` has exactly one call site reachable on the
+  client (wired as `KCPTransport`'s `deliver` callback in `client.go`),
+  fed only by genuine `Input()` → reassembly. There is no separate,
+  non-network path to it.
+
+### Experimental confirmation (causal, not just correlational)
+
+In the same isolated `kcp-server` namespace, **only** the following was
+changed, temporarily, for one test run:
+
+```
+ip netns exec kcp-server sysctl -w net.ipv4.icmp_echo_ignore_all=1
+```
+
+No source code, KCP/FEC parameters, topology, or test harness changed.
+
+| | BEFORE (`icmp_echo_ignore_all=0`, Linux default) | AFTER (`=1`, this namespace only) |
+|---|---|---|
+| PING sent / pong received | 51/0, then separately 43/0 | **14/14** |
+| DNS request → response | server received & replied; client never got it | `result=udp_dns_ok rtt_s=0.0015 resp_txid_match=True ancount=1` |
+| Client-side `DIAG DNS ... dns_response` decode | never observed | **observed for the first time in this entire investigation** |
+| Byte-identical Type-flipped reflection signature | present every run | absent |
+
+Toggling exactly one namespace-scoped kernel setting flipped the test from
+100% failure to 100% success, with everything else held constant. This is
+recorded as a **causally confirmed** root cause, not merely a correlated
+observation:
+
+> **Linux kernel automatic ICMP Echo Reply → reflected KCP segment
+> accepted by the client as real inbound data → client-side `rcv_nxt`
+> desynchronization → the real, legitimate server response is received at
+> the socket but dropped by the KCP receive state machine as a stale
+> duplicate.**
+
+### Scope / safety of what was actually done
+
+- Production host: untouched throughout. `net.ipv4.icmp_echo_ignore_all`
+  on the real host was confirmed `0` before and after this session and was
+  never changed.
+- The isolated test namespace's setting was reverted to `0` after the
+  experiment — nothing persistent was left changed anywhere.
+- No source code was changed by this experiment (a separate, temporary,
+  one-shot byte-capture logging change was made and reverted earlier in
+  the same investigation for the byte-level proof above — not a behavior
+  change, and not present in any committed state).
+- **Current status: ROOT CAUSE CONFIRMED. A permanent fix has not yet been
+  implemented.**
+
+### Next step
+
+The next phase is to separately design and validate a **safe** fix — not
+to implement one reflexively from this doc. In particular:
+
+- **Do not** "just reject inbound ICMP Type=0" as a fix. Type=0 (Echo
+  Reply) is the *only* ICMP type the client ever legitimately receives
+  (`RECV_PROTO = 0` in `client.go` — every real server reply uses it). A
+  blanket rejection would reject 100% of legitimate traffic, not just the
+  kernel reflection, since the reflected packet and a genuine reply are
+  identical at the ICMP-Type level and can only be told apart by origin,
+  not content.
+- Do not change KCP behavior, FEC behavior, or wire-protocol semantics as
+  part of this without a separate, explicit design decision — a prior
+  same-session analysis found no safe way to distinguish "genuine peer
+  reply" from "kernel's own echo of my own request" using only the
+  existing ICMP Type byte, since both are Type=0 to the client.
+- Start with a **source-level analysis** of viable safe mitigations for
+  the real deployment environment (phone client ↔ Pi server over the
+  internet, not the isolated-netns test topology) before writing any code
+  — including whether an OS/deployment-level mitigation (e.g. disabling
+  kernel ICMP echo-reply on the production server host, which is a config
+  change outside this repo, not a protocol change) is acceptable given the
+  Pi is also a normal `ping`-able host for the user, versus a genuine,
+  carefully-designed protocol-level anti-reflection marker.
