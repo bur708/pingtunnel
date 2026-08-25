@@ -147,9 +147,80 @@ func writeICMP(conn icmp.PacketConn, id int, sequence int, sproto int, server *n
 		return err
 	}
 
+	// Some hosts/kernels answer any ICMP Echo Request addressed to them
+	// automatically, independent of and much faster than this project's
+	// own userspace reply - see rememberEchoRequest's doc comment. Only
+	// Echo Requests (icmpEchoRequestType) trigger that, so only those need
+	// tracking here.
+	if sproto == icmpEchoRequestType {
+		rememberEchoRequest(bytes)
+	}
+
 	dst := icmpDstAddr(server)
 	_, err = conn.WriteTo(bytes, dst)
 	return err
+}
+
+// icmpEchoRequestType/icmpEchoReplyType mirror SEND_PROTO/RECV_PROTO
+// (client.go) at the point where writeICMP/recvICMP need to reason about
+// the wire ICMP type itself, rather than just pass it through.
+const (
+	icmpEchoRequestType = 8
+	icmpEchoReplyType   = 0
+)
+
+// echoReflectionWindow bounds how long a just-sent Echo Request's
+// fingerprint is remembered - long enough to catch a same-network-hop
+// kernel reflection (observed arriving within ~100-200us in testing),
+// short enough that legitimate reuse of the same ID/sequence/payload bytes
+// far apart in time is never mistaken for one.
+const echoReflectionWindow = 500 * time.Millisecond
+
+var (
+	recentEchoRequestsMu sync.Mutex
+	recentEchoRequests   = make(map[string]time.Time)
+)
+
+// rememberEchoRequest records the ID/sequence/payload (i.e. everything an
+// ICMP message carries except Type/Code/Checksum) of an Echo Request we
+// just sent, so a same-shaped Echo Reply arriving shortly after can be
+// recognized as a reflection of our own request rather than a genuine
+// reply from the peer - see docs/kcp-dns-investigation-2026-08-24.md's
+// "ROOT CAUSE CONFIRMED" section for the full mechanism this guards
+// against: some destination kernels auto-answer any Echo Request with a
+// verbatim-payload Echo Reply, which this project's recvICMP previously
+// accepted as real inbound data, desynchronizing a fresh KCP session's
+// rcv_nxt and causing the real reply to be dropped as a stale duplicate.
+func rememberEchoRequest(icmpBytes []byte) {
+	if len(icmpBytes) < 8 {
+		return
+	}
+	key := string(icmpBytes[4:])
+	now := time.Now()
+	recentEchoRequestsMu.Lock()
+	recentEchoRequests[key] = now
+	for k, t := range recentEchoRequests {
+		if now.Sub(t) > echoReflectionWindow {
+			delete(recentEchoRequests, k)
+		}
+	}
+	recentEchoRequestsMu.Unlock()
+}
+
+// isEchoReplyReflection reports whether an inbound Echo Reply's
+// ID/sequence/payload exactly match an Echo Request we sent within the
+// last echoReflectionWindow - see rememberEchoRequest. Only called for
+// Type=0 (Echo Reply) packets; a genuine peer reply never matches
+// something we ourselves sent as a Request.
+func isEchoReplyReflection(icmpBytes []byte) bool {
+	if len(icmpBytes) < 8 {
+		return false
+	}
+	key := string(icmpBytes[4:])
+	recentEchoRequestsMu.Lock()
+	t, ok := recentEchoRequests[key]
+	recentEchoRequestsMu.Unlock()
+	return ok && time.Since(t) <= echoReflectionWindow
 }
 
 // kcpReplySproto is the ICMP type to use when a KCP session created here
@@ -187,6 +258,16 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, 
 		}
 
 		if n <= 0 {
+			continue
+		}
+
+		// Drop a kernel-generated reflection of our own Echo Request
+		// before it's ever treated as inbound tunnel data - see
+		// isEchoReplyReflection's doc comment. Only Echo Replies are
+		// checked: a genuine peer reply's bytes never match something we
+		// ourselves just sent as a Request, so this never affects real
+		// traffic (including real Echo Replies from the peer).
+		if bytes[0] == icmpEchoReplyType && isEchoReplyReflection(bytes[:n]) {
 			continue
 		}
 
