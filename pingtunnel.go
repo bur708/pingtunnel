@@ -18,6 +18,17 @@ func sendICMP(id int, sequence int, conn icmp.PacketConn, server *net.IPAddr, ta
 	connId string, msgType uint32, data []byte, sproto int, rproto int, key int,
 	tcpmode int, tcpmode_buffer_size int, tcpmode_maxwin int, tcpmode_resend_time int, tcpmode_compress int, tcpmode_stat int,
 	timeout int, cryptoConfig *CryptoConfig, fecSender *FECSender, kcpTransport *KCPTransport, rateLimiter *RateLimiter) {
+	if diagIsDNS(target, data) {
+		loggo.Info("DIAG DNS endpoint=%s stage=pingtunnel_send conn=%s target=%s %s selected=%s", diagEndpoint(sproto), connId, target, diagDNS(data), func() string {
+			if kcpTransport != nil {
+				return "kcp"
+			}
+			if fecSender != nil {
+				return "fec"
+			}
+			return "plain"
+		}())
+	}
 
 	m := &MyMsg{
 		Id:                  connId,
@@ -65,9 +76,19 @@ func sendICMP(id int, sequence int, conn icmp.PacketConn, server *net.IPAddr, ta
 		// line-block another - see kcpFlowID's doc comment.
 		flowID := kcpFlowID(connId)
 		destKey := fmt.Sprintf("%s|%d|%d", server.String(), id, flowID)
-		session := kcpTransport.Session(destKey, server, id, func(segment []byte) {
-			if err := writeICMP(conn, id, 0, sproto, server, kcpTransport.BuildPacket(flowID, segment), rateLimiter); err != nil {
+		var session *KCPSession
+		session = kcpTransport.Session(destKey, server, id, func(segment []byte) {
+			ws := time.Now().UnixNano()
+			err := writeICMP(conn, id, 0, sproto, server, kcpTransport.BuildPacket(flowID, segment), rateLimiter)
+			we := time.Now().UnixNano()
+			session.diag.writeStart.Store(ws)
+			session.diag.writeEnd.Store(we)
+			session.diag.writeNS.Store(we - ws)
+			if err != nil {
+				session.diag.writeErr.Store(1)
 				loggo.Error("sendICMP kcp write error %s %s", server.String(), err)
+			} else {
+				session.diag.writeErr.Store(0)
 			}
 		})
 		if err := session.Send(mb); err != nil {
@@ -126,8 +147,9 @@ func writeICMP(conn icmp.PacketConn, id int, sequence int, sproto int, server *n
 		return err
 	}
 
-	conn.WriteTo(bytes, icmpDstAddr(server))
-	return nil
+	dst := icmpDstAddr(server)
+	_, err = conn.WriteTo(bytes, dst)
+	return err
 }
 
 // kcpReplySproto is the ICMP type to use when a KCP session created here
@@ -212,9 +234,19 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, 
 			// flow's traffic land on the very same KCPSession - see
 			// KCPTransport's and kcpFlowID's doc comments for why.
 			sessionKey := fmt.Sprintf("%s|%d|%d", src.String(), echoId, flowID)
-			session := kcpTransport.Session(sessionKey, src, echoId, func(seg []byte) {
-				if err := writeICMP(conn, echoId, 0, kcpReplySproto, src, kcpTransport.BuildPacket(flowID, seg), rateLimiter); err != nil {
+			var session *KCPSession
+			session = kcpTransport.Session(sessionKey, src, echoId, func(seg []byte) {
+				ws := time.Now().UnixNano()
+				err := writeICMP(conn, echoId, 0, kcpReplySproto, src, kcpTransport.BuildPacket(flowID, seg), rateLimiter)
+				we := time.Now().UnixNano()
+				session.diag.writeStart.Store(ws)
+				session.diag.writeEnd.Store(we)
+				session.diag.writeNS.Store(we - ws)
+				if err != nil {
+					session.diag.writeErr.Store(1)
 					loggo.Error("recvICMP kcp write error %s %s", src.String(), err)
+				} else {
+					session.diag.writeErr.Store(0)
 				}
 			})
 			session.Input(segment)
@@ -251,6 +283,9 @@ func deliverPayload(mb []byte, cryptoConfig *CryptoConfig, recv chan<- *Packet, 
 	if my.Magic != (int32)(MyMsg_MAGIC) {
 		loggo.Debug("processPacket data invalid %s", my.Id)
 		return
+	}
+	if diagIsDNS(my.Target, my.Data) {
+		loggo.Info("DIAG DNS endpoint=%s stage=pingtunnel_decoded conn=%s target=%s %s echo=%d peer=%v", diagDecodedEndpoint(my.Rproto), my.Id, my.Target, diagDNS(my.Data), echoId, src)
 	}
 
 	recv <- &Packet{my: my, src: src, echoId: echoId, echoSeq: echoSeq}
