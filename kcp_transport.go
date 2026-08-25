@@ -263,6 +263,42 @@ type KCPSession struct {
 	// lastActivityUnixNano is touched on every Send/Input, read by
 	// KCPTransport's idle reaper - see kcpSessionIdleTimeout.
 	lastActivityUnixNano atomic.Int64
+
+	// TEMP forensic instrumentation for the 2026-08-24 KCP/DNS investigation,
+	// populated by the write-site capture in pingtunnel.go (sendICMP/recvICMP's
+	// sendRaw closures) immediately after the real conn.WriteTo call. Not read
+	// anywhere in this file - deliberately no watchdog/poller lives here.
+	diag kcpDiagState
+}
+
+// kcpDiagState holds the actual ICMP write-site result for a session's most
+// recent KCP output, captured by the caller-supplied sendRaw closure, plus a
+// few in-place timing samples taken at existing lock/goroutine boundaries in
+// this file (updateLoop's tick, the Output callback). All fields are
+// lock-free atomics, written only by the goroutine already doing the
+// corresponding work - nothing in this file reads them (see DiagSnapshot).
+type kcpDiagState struct {
+	writeStart, writeEnd, writeNS atomic.Int64
+	writeErr                      atomic.Int64
+
+	// updateNS is engine.Update()'s duration alone (excludes drainLocked),
+	// sampled once per updateLoop tick under the tick's own s.mu.
+	updateNS atomic.Int64
+	// waitSnd is engine.WaitSnd(), sampled immediately after Update() in the
+	// same tick, still under the same already-held s.mu - no new lock.
+	waitSnd atomic.Int64
+	// outputNS is the complete Output callback's duration (copy + sendRaw,
+	// i.e. including writeICMP) - outputNS minus writeNS isolates non-write
+	// overhead (BuildPacket/HMAC, buffer copy) from the write span itself.
+	outputNS atomic.Int64
+}
+
+// DiagSnapshot returns a point-in-time read of this session's diagnostic
+// state. Atomic loads only - no lock, no side effects, not called from
+// anywhere in this codebase yet.
+func (s *KCPSession) DiagSnapshot() (updateNS, waitSnd, outputNS, writeNS, writeErr int64) {
+	return s.diag.updateNS.Load(), s.diag.waitSnd.Load(), s.diag.outputNS.Load(),
+		s.diag.writeNS.Load(), s.diag.writeErr.Load()
 }
 
 // lastActivity returns when this session last saw Send or Input activity.
@@ -288,9 +324,11 @@ func NewKCPSession(cfg *KCPConfig, sendRaw func(segment []byte)) *KCPSession {
 	s.touchActivity()
 
 	s.engine = kcp.NewKCP(kcpConv, func(buf []byte, size int) {
+		outputStart := time.Now()
 		cp := make([]byte, size)
 		copy(cp, buf[:size])
 		sendRaw(cp)
+		s.diag.outputNS.Store(time.Since(outputStart).Nanoseconds())
 	})
 
 	nodelay, interval, resend, nc := cfg.NoDelay, cfg.Interval, cfg.Resend, cfg.NoCongestion
@@ -331,7 +369,10 @@ func (s *KCPSession) updateLoop(interval time.Duration) {
 			return
 		case <-ticker.C:
 			s.mu.Lock()
+			updateStart := time.Now()
 			s.engine.Update()
+			s.diag.updateNS.Store(time.Since(updateStart).Nanoseconds())
+			s.diag.waitSnd.Store(int64(s.engine.WaitSnd()))
 			msgs := s.drainLocked()
 			s.mu.Unlock()
 			s.deliver(msgs)
