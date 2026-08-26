@@ -175,12 +175,48 @@ type ClientConn struct {
 	activeRecvTime time.Time
 	activeSendTime time.Time
 	close          bool
-	udpRelayConn   *net.UDPConn
+	udpRelay       *sock5UDPRelay
 	udpTargetAddr  string
 	activity       chan struct{}
 
 	fm *network.FrameMgr
 }
+
+// sock5UDPRelay is the shared state for one SOCKS5 UDP-ASSOCIATE relay
+// socket, referenced by every ClientConn multiplexed onto it (one relay can
+// carry many concurrent flows, e.g. many DNS lookups). Its lifetime is
+// deliberately decoupled from the TCP control connection's lifetime:
+// closing the control connection stops new datagrams from being accepted
+// (see AcceptSock5UDPConn's stopAccepting), but must not by itself destroy
+// a flow whose reply is still in flight over KCP - see closeSock5UDPFlows
+// and checkTimeoutConn for how an outstanding flow's ClientConn survives
+// the control connection closing, bounded by sock5UDPOutstandingGrace.
+type sock5UDPRelay struct {
+	conn          *net.UDPConn
+	stopAccepting chan struct{}
+	closeOnce     sync.Once
+
+	// controlClosedAt is zero while the TCP control connection is still
+	// open. Once set, it marks when this relay stopped accepting new
+	// datagrams - checkTimeoutConn uses it to apply sock5UDPOutstandingGrace
+	// instead of the general p.timeout to any still-outstanding flow left
+	// on this relay, and to close the relay once nothing references it.
+	controlClosedAt time.Time
+}
+
+func (r *sock5UDPRelay) close() {
+	r.closeOnce.Do(func() {
+		r.conn.Close()
+	})
+}
+
+// sock5UDPOutstandingGrace bounds how long a ClientConn is kept routable
+// after its relay's control connection has already closed while a reply
+// was still in flight. This is a lifecycle safety net (long enough to
+// cover a real KCP round trip with margin, e.g. the ~12ms measured in
+// production), not a protocol timeout, and is deliberately not tied to any
+// particular external caller's own retry timing.
+const sock5UDPOutstandingGrace = 1500 * time.Millisecond
 
 func (p *Client) Addr() string {
 	return p.addr
@@ -842,7 +878,7 @@ func (p *Client) processPacket(packet *Packet) {
 		}
 		addr := clientConn.ipaddr
 		var err error
-		if clientConn.udpRelayConn != nil {
+		if clientConn.udpRelay != nil {
 			udpTargetAddr := clientConn.udpTargetAddr
 			if packet.my.Target != "" {
 				udpTargetAddr = packet.my.Target
@@ -853,7 +889,7 @@ func (p *Client) processPacket(packet *Packet) {
 				clientConn.close = true
 				return
 			}
-			_, err = clientConn.udpRelayConn.WriteToUDP(udpPacket, addr)
+			_, err = clientConn.udpRelay.conn.WriteToUDP(udpPacket, addr)
 		} else {
 			_, err = p.listenConn.WriteToUDP(packet.my.Data, addr)
 		}
@@ -895,14 +931,43 @@ func (p *Client) checkTimeoutConn() {
 	})
 
 	now := common.GetNowUpdateInSecond()
+	relaysToRecheck := make(map[*sock5UDPRelay]bool)
 	for _, conn := range tmp {
 		if conn.tcpmode > 0 {
 			continue
 		}
-		diffrecv := now.Sub(conn.activeRecvTime)
-		diffsend := now.Sub(conn.activeSendTime)
-		if diffrecv > time.Second*(time.Duration(p.timeout)) || diffsend > time.Second*(time.Duration(p.timeout)) {
+		relay := conn.udpRelay
+		controlClosed := relay != nil && !relay.controlClosedAt.IsZero()
+		// A flow is outstanding as long as its last receive isn't strictly
+		// after its last send. Deliberately NOT activeSendTime.After(recv):
+		// a brand-new ClientConn is created with both timestamps set to the
+		// exact same value (its first send hasn't been answered yet), and
+		// .After() is false on equal times - using it here would treat
+		// every fresh flow's first request as "already answered".
+		outstanding := !conn.activeRecvTime.After(conn.activeSendTime)
+
+		switch {
+		case controlClosed && !outstanding:
+			// Already answered (or never sent) after its relay's control
+			// connection closed early - nothing more to wait for.
 			conn.close = true
+			relaysToRecheck[relay] = true
+		case controlClosed && outstanding:
+			// Still awaiting a reply after its relay's control connection
+			// closed early - bounded grace period, independent of the
+			// general idle timeout below.
+			if now.Sub(relay.controlClosedAt) > sock5UDPOutstandingGrace {
+				conn.close = true
+				relaysToRecheck[relay] = true
+			}
+		default:
+			// Normal case: control connection (if any) still open,
+			// governed by the existing general idle timeout, unchanged.
+			diffrecv := now.Sub(conn.activeRecvTime)
+			diffsend := now.Sub(conn.activeSendTime)
+			if diffrecv > time.Second*(time.Duration(p.timeout)) || diffsend > time.Second*(time.Duration(p.timeout)) {
+				conn.close = true
+			}
 		}
 	}
 
@@ -918,6 +983,31 @@ func (p *Client) checkTimeoutConn() {
 			loggo.Info("close inactive conn %s %s", id, addr)
 			p.close(conn)
 		}
+	}
+
+	for relay := range relaysToRecheck {
+		p.closeSock5UDPRelayIfIdle(relay)
+	}
+}
+
+// closeSock5UDPRelayIfIdle closes a relay's socket once its control
+// connection has already closed and no ClientConn still references it -
+// see checkTimeoutConn and closeSock5UDPFlows.
+func (p *Client) closeSock5UDPRelayIfIdle(relay *sock5UDPRelay) {
+	if relay == nil || relay.controlClosedAt.IsZero() {
+		return
+	}
+	stillUsed := false
+	p.localIdToConnMap.Range(func(_, value interface{}) bool {
+		clientConn := value.(*ClientConn)
+		if clientConn.udpRelay == relay {
+			stillUsed = true
+			return false
+		}
+		return true
+	})
+	if !stillUsed {
+		relay.close()
 	}
 }
 
@@ -1021,6 +1111,7 @@ func (p *Client) AcceptSock5UDPConn(conn *net.TCPConn, associateAddr string) {
 		conn.Close()
 		return
 	}
+	relay := &sock5UDPRelay{conn: relayConn, stopAccepting: make(chan struct{})}
 
 	relayAddr := copyUDPAddr(relayConn.LocalAddr().(*net.UDPAddr))
 	if relayAddr.IP == nil || relayAddr.IP.IsUnspecified() {
@@ -1035,7 +1126,7 @@ func (p *Client) AcceptSock5UDPConn(conn *net.TCPConn, associateAddr string) {
 
 	if err := writeSocks5Reply(conn, socks5ReplySucceeded, relayAddr.String()); err != nil {
 		loggo.Error("send udp associate confirmation: %s", err)
-		relayConn.Close()
+		relay.close()
 		conn.Close()
 		return
 	}
@@ -1047,7 +1138,7 @@ func (p *Client) AcceptSock5UDPConn(conn *net.TCPConn, associateAddr string) {
 	udpExit := make(chan struct{})
 	go func() {
 		defer close(udpExit)
-		p.recvSock5UDP(relayConn, expectedIP, expectedPort)
+		p.recvSock5UDP(relay, expectedIP, expectedPort)
 	}()
 
 	ctrlBuf := make([]byte, 1)
@@ -1064,14 +1155,20 @@ func (p *Client) AcceptSock5UDPConn(conn *net.TCPConn, associateAddr string) {
 	}
 
 	conn.Close()
-	relayConn.Close()
+	// Stop accepting new datagrams immediately - the association is over -
+	// but do NOT close the relay socket yet: a flow that already sent a
+	// request may still have its reply in flight over KCP, and needs a
+	// live, writable socket to receive it on. closeSock5UDPFlows below
+	// decides, per flow, whether to close now or leave it briefly
+	// routable (see sock5UDPOutstandingGrace / checkTimeoutConn).
+	close(relay.stopAccepting)
 	<-udpExit
-	p.closeSock5UDPFlows(relayConn)
+	p.closeSock5UDPFlows(relay)
 
 	loggo.Info("close sock5 udp associate relay %s", relayAddr.String())
 }
 
-func (p *Client) recvSock5UDP(relayConn *net.UDPConn, expectedIP net.IP, expectedPort int) {
+func (p *Client) recvSock5UDP(relay *sock5UDPRelay, expectedIP net.IP, expectedPort int) {
 
 	defer common.CrashLog()
 
@@ -1082,11 +1179,23 @@ func (p *Client) recvSock5UDP(relayConn *net.UDPConn, expectedIP net.IP, expecte
 	var sourceAddr *net.UDPAddr
 
 	for !p.exit {
-		relayConn.SetReadDeadline(time.Now().Add(time.Millisecond * 100))
-		n, srcaddr, err := relayConn.ReadFromUDP(bytes)
+		// Always attempt a read first, unconditionally - a datagram the
+		// caller already sent before closing the control connection may
+		// already be sitting in the kernel's receive buffer by the time
+		// stopAccepting is closed, and must still be drained. Only once a
+		// read comes back empty (nothing pending right now) do we check
+		// stopAccepting, so "stop accepting" means "stop accepting
+		// genuinely new work", not "abandon what's already arrived".
+		relay.conn.SetReadDeadline(time.Now().Add(time.Millisecond * 100))
+		n, srcaddr, err := relay.conn.ReadFromUDP(bytes)
 		if err != nil {
 			nerr, ok := err.(net.Error)
 			if ok && nerr.Timeout() {
+				select {
+				case <-relay.stopAccepting:
+					return
+				default:
+				}
 				continue
 			}
 			if !p.exit {
@@ -1110,7 +1219,7 @@ func (p *Client) recvSock5UDP(relayConn *net.UDPConn, expectedIP net.IP, expecte
 		}
 
 		now := common.GetNowUpdateInSecond()
-		connKey := p.sock5UDPConnKey(relayConn, srcaddr, targetAddr)
+		connKey := p.sock5UDPConnKey(relay.conn, srcaddr, targetAddr)
 		clientConn := p.getClientConnByAddr(connKey)
 		if clientConn == nil {
 			if p.maxconn > 0 && p.localIdToConnMapSize >= p.maxconn {
@@ -1126,7 +1235,7 @@ func (p *Client) recvSock5UDP(relayConn *net.UDPConn, expectedIP net.IP, expecte
 				activeRecvTime: now,
 				activeSendTime: now,
 				close:          false,
-				udpRelayConn:   relayConn,
+				udpRelay:       relay,
 				udpTargetAddr:  targetAddr,
 			}
 			p.addClientConn(uuid, connKey, clientConn)
@@ -1161,18 +1270,41 @@ func (p *Client) allowSock5UDPSource(srcaddr *net.UDPAddr, expectedIP net.IP, ex
 	return (*sourceAddr).IP.Equal(srcaddr.IP) && (*sourceAddr).Port == srcaddr.Port
 }
 
-func (p *Client) closeSock5UDPFlows(relayConn *net.UDPConn) {
-	var tmp []*ClientConn
+// closeSock5UDPFlows runs when a relay's TCP control connection has just
+// closed. It does not unconditionally tear every flow down: a flow that
+// already sent a request and hasn't received its reply yet (see
+// ClientConn.activeSendTime/activeRecvTime) is left routable so a
+// still-in-flight KCP response can still reach it via processPacket -
+// checkTimeoutConn bounds how long that lasts via sock5UDPOutstandingGrace.
+// Only once nothing outstanding remains does the relay socket itself get
+// closed.
+func (p *Client) closeSock5UDPFlows(relay *sock5UDPRelay) {
+	relay.controlClosedAt = common.GetNowUpdateInSecond()
+
+	var toClose []*ClientConn
+	outstanding := false
 	p.localIdToConnMap.Range(func(key, value interface{}) bool {
 		clientConn := value.(*ClientConn)
-		if clientConn.tcpmode == 0 && clientConn.udpRelayConn == relayConn {
-			tmp = append(tmp, clientConn)
+		if clientConn.tcpmode != 0 || clientConn.udpRelay != relay {
+			return true
 		}
+		// See checkTimeoutConn's matching comment: a brand-new ClientConn
+		// has activeSendTime == activeRecvTime, which must count as
+		// outstanding (its only request hasn't been answered yet).
+		if !clientConn.activeRecvTime.After(clientConn.activeSendTime) {
+			outstanding = true
+			return true
+		}
+		toClose = append(toClose, clientConn)
 		return true
 	})
 
-	for _, clientConn := range tmp {
+	for _, clientConn := range toClose {
 		p.close(clientConn)
+	}
+
+	if !outstanding {
+		relay.close()
 	}
 }
 
