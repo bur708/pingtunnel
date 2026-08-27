@@ -281,7 +281,7 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, 
 		src := icmpSrcToIPAddr(srcaddr)
 
 		if fecReceiver != nil && IsFECPacket(payloadData) {
-			h, content, err := ParseFECHeader(payloadData)
+			h, content, err := fecReceiver.ParseHeader(payloadData)
 			if err != nil {
 				loggo.Debug("recvICMP fec header parse error: %s", err)
 				continue

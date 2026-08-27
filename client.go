@@ -54,8 +54,9 @@ func NewClient(addr string, server string, target string, timeout int, key int, 
 	var fecSender *FECSender
 	var fecReceiver *FECReceiver
 	if fecConfig != nil {
-		fecSender = NewFECSender(fecConfig)
-		fecReceiver = NewFECReceiver(fecConfig)
+		fecMacKey := deriveFECMacKey(cryptoConfig, key)
+		fecSender = NewFECSender(fecConfig, fecMacKey)
+		fecReceiver = NewFECReceiver(fecConfig, fecMacKey)
 	}
 
 	rand.Seed(time.Now().UnixNano())

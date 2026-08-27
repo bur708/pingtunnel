@@ -6,6 +6,14 @@ import (
 	"testing"
 )
 
+// testFECMacKey is a fixed key used throughout this file - these tests only
+// exercise wire-format/reconstruction correctness, not key derivation
+// (deriveFECMacKey has its own coverage via kcp_transport_test.go's
+// equivalent for KCP, and this file's job is FEC-specific behavior).
+func testFECMacKey() []byte {
+	return []byte("test-fec-mac-key")
+}
+
 func TestFECEncodeDecodeNoLoss(t *testing.T) {
 	cfg, err := NewFECConfig(10, 3)
 	if err != nil {
@@ -17,7 +25,7 @@ func TestFECEncodeDecodeNoLoss(t *testing.T) {
 		payloads[i] = randPayload(i + 1)
 	}
 
-	packets, err := cfg.EncodeGroup(42, payloads)
+	packets, err := cfg.EncodeGroup(testFECMacKey(), 42, payloads)
 	if err != nil {
 		t.Fatalf("EncodeGroup: %v", err)
 	}
@@ -27,7 +35,7 @@ func TestFECEncodeDecodeNoLoss(t *testing.T) {
 
 	shards := make([][]byte, cfg.TotalShards())
 	for i, pkt := range packets {
-		h, content, err := ParseFECHeader(pkt)
+		h, content, err := ParseFECHeader(testFECMacKey(), pkt)
 		if err != nil {
 			t.Fatalf("ParseFECHeader: %v", err)
 		}
@@ -60,7 +68,7 @@ func TestFECEncodeDecodeWithMaxLoss(t *testing.T) {
 		payloads[i] = randPayload(50 + i*7)
 	}
 
-	packets, err := cfg.EncodeGroup(7, payloads)
+	packets, err := cfg.EncodeGroup(testFECMacKey(), 7, payloads)
 	if err != nil {
 		t.Fatalf("EncodeGroup: %v", err)
 	}
@@ -78,7 +86,7 @@ func TestFECEncodeDecodeWithMaxLoss(t *testing.T) {
 		if dropped[i] {
 			continue
 		}
-		h, content, err := ParseFECHeader(pkt)
+		h, content, err := ParseFECHeader(testFECMacKey(), pkt)
 		if err != nil {
 			t.Fatalf("ParseFECHeader: %v", err)
 		}
@@ -105,7 +113,7 @@ func TestFECDecodeFailsWithTooManyLosses(t *testing.T) {
 		payloads[i] = randPayload(20 + i)
 	}
 
-	packets, err := cfg.EncodeGroup(1, payloads)
+	packets, err := cfg.EncodeGroup(testFECMacKey(), 1, payloads)
 	if err != nil {
 		t.Fatalf("EncodeGroup: %v", err)
 	}
@@ -116,7 +124,7 @@ func TestFECDecodeFailsWithTooManyLosses(t *testing.T) {
 		if i < parityShards+1 {
 			continue
 		}
-		h, content, err := ParseFECHeader(pkt)
+		h, content, err := ParseFECHeader(testFECMacKey(), pkt)
 		if err != nil {
 			t.Fatalf("ParseFECHeader: %v", err)
 		}
@@ -129,13 +137,13 @@ func TestFECDecodeFailsWithTooManyLosses(t *testing.T) {
 }
 
 func TestFECHeaderRoundTrip(t *testing.T) {
-	pkt := buildFECPacket(123456, 5, 10, 3, 888, []byte("hello world"))
+	pkt := buildFECPacket(testFECMacKey(), 123456, 5, 10, 3, 888, []byte("hello world"))
 
 	if !IsFECPacket(pkt) {
 		t.Fatalf("expected IsFECPacket to be true")
 	}
 
-	h, content, err := ParseFECHeader(pkt)
+	h, content, err := ParseFECHeader(testFECMacKey(), pkt)
 	if err != nil {
 		t.Fatalf("ParseFECHeader: %v", err)
 	}
@@ -144,6 +152,32 @@ func TestFECHeaderRoundTrip(t *testing.T) {
 	}
 	if string(content) != "hello world" {
 		t.Fatalf("content mismatch: %q", content)
+	}
+}
+
+// TestFECHeaderRejectsWrongMacKey is the FEC-side companion to
+// TestKCPWireFramingRejectsWrongMacKey: a packet built with one key must be
+// rejected by a verifier using a different one, exactly the property that
+// makes the 2026-08-27 authentication fix meaningful (an attacker without
+// the shared secret cannot forge an accepted packet).
+func TestFECHeaderRejectsWrongMacKey(t *testing.T) {
+	pkt := buildFECPacket(testFECMacKey(), 1, 0, 10, 3, 5, []byte("hello"))
+	if _, _, err := ParseFECHeader([]byte("a different key entirely"), pkt); err == nil {
+		t.Fatalf("expected ParseFECHeader to reject a packet authenticated with a different macKey")
+	}
+}
+
+// TestFECHeaderRejectsTamperedFields ensures the tag covers the header
+// fields themselves, not just the shard content - tampering with the group
+// number alone (without knowing the key) must be caught, not silently
+// accepted as if it were a legitimate different group/index.
+func TestFECHeaderRejectsTamperedFields(t *testing.T) {
+	pkt := buildFECPacket(testFECMacKey(), 1, 0, 10, 3, 5, []byte("hello"))
+	tampered := append([]byte(nil), pkt...)
+	fieldsOff := 1 + fecMacSize
+	tampered[fieldsOff] ^= 0xFF // flip a byte of the group number
+	if _, _, err := ParseFECHeader(testFECMacKey(), tampered); err == nil {
+		t.Fatalf("expected ParseFECHeader to reject a packet with a tampered header field")
 	}
 }
 
@@ -170,8 +204,8 @@ func TestFECSenderReceiverStreamingNoLoss(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFECConfig: %v", err)
 	}
-	sender := NewFECSender(cfg)
-	receiver := NewFECReceiver(cfg)
+	sender := NewFECSender(cfg, testFECMacKey())
+	receiver := NewFECReceiver(cfg, testFECMacKey())
 
 	const total = 25 // 2 full groups + a partial one
 	payloads := make([][]byte, total)
@@ -185,7 +219,7 @@ func TestFECSenderReceiverStreamingNoLoss(t *testing.T) {
 		if !ok {
 			t.Fatalf("WrapData(%d): expected ok=true", i)
 		}
-		h, content, err := ParseFECHeader(framed)
+		h, content, err := ParseFECHeader(testFECMacKey(), framed)
 		if err != nil {
 			t.Fatalf("ParseFECHeader(%d): %v", i, err)
 		}
@@ -193,7 +227,7 @@ func TestFECSenderReceiverStreamingNoLoss(t *testing.T) {
 			delivered = append(delivered, d.mb)
 		}
 		for _, pkt := range parity {
-			ph, pcontent, err := ParseFECHeader(pkt)
+			ph, pcontent, err := ParseFECHeader(testFECMacKey(), pkt)
 			if err != nil {
 				t.Fatalf("ParseFECHeader(parity): %v", err)
 			}
@@ -214,8 +248,8 @@ func TestFECSenderReceiverStreamingWithLoss(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFECConfig: %v", err)
 	}
-	sender := NewFECSender(cfg)
-	receiver := NewFECReceiver(cfg)
+	sender := NewFECSender(cfg, testFECMacKey())
+	receiver := NewFECReceiver(cfg, testFECMacKey())
 
 	const groups = 3
 	total := cfg.DataShards * groups
@@ -234,13 +268,13 @@ func TestFECSenderReceiverStreamingWithLoss(t *testing.T) {
 		if !ok {
 			t.Fatalf("WrapData: expected ok=true")
 		}
-		h, content, err := ParseFECHeader(framed)
+		h, content, err := ParseFECHeader(testFECMacKey(), framed)
 		if err != nil {
 			t.Fatalf("ParseFECHeader: %v", err)
 		}
 		wire = append(wire, pkt{h, content})
 		for _, pp := range parity {
-			ph, pcontent, err := ParseFECHeader(pp)
+			ph, pcontent, err := ParseFECHeader(testFECMacKey(), pp)
 			if err != nil {
 				t.Fatalf("ParseFECHeader(parity): %v", err)
 			}
@@ -297,7 +331,7 @@ func TestFECReceiverParamMismatchDropsWithoutPanic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFECConfig: %v", err)
 	}
-	receiver := NewFECReceiver(cfg)
+	receiver := NewFECReceiver(cfg, testFECMacKey())
 
 	h := &FECHeader{Group: 0, ShardIndex: 0, DataShards: 8, ParityShards: 2, OrigLen: 5}
 	content, _ := fecShardContent([]byte("hello"))
@@ -328,7 +362,7 @@ func sendAllViaAdaptiveSender(t *testing.T, sender *FECSender, destKey string, p
 func feedAllToAdaptiveReceiver(receiver *FECReceiver, destKey string, packets [][]byte) [][]byte {
 	var delivered [][]byte
 	for _, pkt := range packets {
-		h, content, err := ParseFECHeader(pkt)
+		h, content, err := ParseFECHeader(testFECMacKey(), pkt)
 		if err != nil {
 			continue
 		}
@@ -345,14 +379,14 @@ func feedAllToAdaptiveReceiver(receiver *FECReceiver, destKey string, packets []
 // and independently - matching the "two clients, two different -fec-data/
 // -fec-parity choices, one server with neither flag set" scenario.
 func TestAdaptiveFECTwoPeersDifferentParams(t *testing.T) {
-	receiver := NewAdaptiveFECReceiver()
+	receiver := NewAdaptiveFECReceiver(testFECMacKey())
 
 	send := func(destKey string, dataShards, parityShards int, payloads [][]byte) [][]byte {
 		cfg, err := NewFECConfig(dataShards, parityShards)
 		if err != nil {
 			t.Fatalf("NewFECConfig(%d,%d): %v", dataShards, parityShards, err)
 		}
-		sender := NewFECSender(cfg)
+		sender := NewFECSender(cfg, testFECMacKey())
 		return sendAllViaAdaptiveSender(t, sender, destKey, payloads)
 	}
 
@@ -374,7 +408,7 @@ func TestAdaptiveFECTwoPeersDifferentParams(t *testing.T) {
 // (which a peer fully controls) must be rejected, not used to allocate an
 // oversized shard buffer.
 func TestAdaptiveFECReceiverRejectsOversizedShardCounts(t *testing.T) {
-	receiver := NewAdaptiveFECReceiver()
+	receiver := NewAdaptiveFECReceiver(testFECMacKey())
 	h := &FECHeader{Group: 0, ShardIndex: 0, DataShards: 200, ParityShards: 200, OrigLen: 5}
 	content, _ := fecShardContent([]byte("hello"))
 
@@ -393,7 +427,7 @@ func TestAdaptiveFECSenderUsesResolvedParams(t *testing.T) {
 	sender := NewAdaptiveFECSender(func(destKey string) (int, int, bool) {
 		v, ok := resolved[destKey]
 		return v[0], v[1], ok
-	})
+	}, testFECMacKey())
 
 	if _, _, ok := sender.WrapData("peerA", []byte("x")); !ok {
 		t.Fatalf("expected WrapData to succeed for a resolvable destKey")

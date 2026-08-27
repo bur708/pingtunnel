@@ -1,6 +1,8 @@
 package pingtunnel
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -14,17 +16,66 @@ import (
 // Wire format of an FEC packet, prepended before the (already encrypted) frame
 // bytes whenever FEC is enabled:
 //
-//	[0]     version/flag byte, always FECVersion for a valid FEC packet
-//	[1:5]   group number, uint32 big-endian
-//	[5]     shard index within the group, uint8
-//	[6]     number of data shards in the group, uint8
-//	[7]     number of parity shards in the group, uint8
-//	[8:10]  original length of this data shard, uint16 big-endian (0 for parity shards)
-//	[10:]   shard payload, zero-padded so every shard in a group is the same length
+//	[0]      version/flag byte, always FECVersion for a valid FEC packet
+//	[1:9]    truncated HMAC-SHA256 tag over everything from [9:] (see fecTag)
+//	[9:13]   group number, uint32 big-endian
+//	[13]     shard index within the group, uint8
+//	[14]     number of data shards in the group, uint8
+//	[15]     number of parity shards in the group, uint8
+//	[16:18]  original length of this data shard, uint16 big-endian (0 for parity shards)
+//	[18:]    shard payload, zero-padded so every shard in a group is the same length
+//
+// The tag authenticates the header fields as well as the payload - not just
+// the payload - so an attacker can't redirect an otherwise-valid shard into
+// a different group/index by tampering with those bytes alone. Added
+// 2026-08-27: unlike KCP segments (kcp_transport.go's kcpTag, added in the
+// 2026-08-22 security review specifically to stop off-path ACK forgery),
+// FEC packets originally had zero authentication - anyone who could inject
+// spoofed packets carrying the FECVersion byte, without knowing the tunnel's
+// shared secret at all, could feed forged shards into a real peer's
+// in-flight Reed-Solomon reconstruction (FECReceiver.Feed keys groups purely
+// by destKey = src|echoId, both directly observable on the wire, not
+// secret) and corrupt what a legitimate message reconstructs to. This tag
+// closes that gap the same way the KCP one already did.
 const (
 	FECVersion    byte = 1
-	FECHeaderSize      = 10
+	fecMacSize         = 8 // truncated HMAC-SHA256, matches kcpMacSize's convention
+	fecFieldsSize      = 4 + 1 + 1 + 1 + 2
+	FECHeaderSize      = 1 + fecMacSize + fecFieldsSize
 )
+
+// deriveFECMacKey derives the key used to authenticate FEC packets from
+// whatever secret already gates this tunnel (the encryption key when
+// -encrypt is set, otherwise the numeric -key) - mirrors
+// deriveKCPMacKey (kcp_transport.go) exactly except for the
+// domain-separation prefix, so the two derived keys can never collide or be
+// mistaken for one another even though both ultimately stem from the same
+// underlying secret.
+func deriveFECMacKey(cryptoConfig *CryptoConfig, key int) []byte {
+	h := sha256.New()
+	h.Write([]byte("pingtunnel-fec-mac|"))
+	if cryptoConfig != nil && len(cryptoConfig.Key) > 0 {
+		h.Write(cryptoConfig.Key)
+	} else {
+		h.Write([]byte(fmt.Sprintf("%d", key)))
+	}
+	return h.Sum(nil)
+}
+
+// fecTag computes the truncated HMAC-SHA256 tag for one shard's header
+// fields plus its content, keyed by macKey.
+func fecTag(macKey []byte, group uint32, shardIndex, dataShards, parityShards uint8, origLen uint16, content []byte) []byte {
+	mac := hmac.New(sha256.New, macKey)
+	var fields [fecFieldsSize]byte
+	binary.BigEndian.PutUint32(fields[0:4], group)
+	fields[4] = shardIndex
+	fields[5] = dataShards
+	fields[6] = parityShards
+	binary.BigEndian.PutUint16(fields[7:9], origLen)
+	mac.Write(fields[:])
+	mac.Write(content)
+	return mac.Sum(nil)[:fecMacSize]
+}
 
 // FECMaxPayload is the largest already-encrypted frame (mb) that FEC will
 // protect. Every FEC shard, data or parity, is padded to this size (plus a
@@ -33,8 +84,8 @@ const (
 // has to be fixed up front rather than computed from the group's actual
 // contents. Kept low (well under low-MTU paths like Starlink ~1400,
 // Cloudflare WARP ~1420, or the IPv6 minimum MTU of 1280) so a full FEC
-// packet - 10 header + 2 prefix + FECMaxPayload shard + 8 ICMP + 20 IPv4 =
-// 1040 bytes at 1000 - never gets fragmented and dropped by a strict link,
+// packet - 18 header + 2 prefix + FECMaxPayload shard + 8 ICMP + 20 IPv4 =
+// 1048 bytes at 1000 - never gets fragmented and dropped by a strict link,
 // which would defeat the point of adding FEC. Measured worst case for a
 // MyMsg (max-length id/target strings, FRAME_MAX_SIZE data, ChaCha20-
 // Poly1305 overhead) is ~1022 bytes, just over this cap: WrapData falls
@@ -135,7 +186,7 @@ func (c *fecConfigCache) get(dataShards, parityShards int) (*FECConfig, error) {
 // prefix of the shard's own coded content (not only in the header), so it
 // survives reconstruction on the receive side even when the packet carrying
 // that header was itself lost.
-func (f *FECConfig) EncodeGroup(group uint32, payloads [][]byte) ([][]byte, error) {
+func (f *FECConfig) EncodeGroup(macKey []byte, group uint32, payloads [][]byte) ([][]byte, error) {
 	if len(payloads) != f.DataShards {
 		return nil, fmt.Errorf("fec: EncodeGroup expected %d payloads, got %d", f.DataShards, len(payloads))
 	}
@@ -162,7 +213,7 @@ func (f *FECConfig) EncodeGroup(group uint32, payloads [][]byte) ([][]byte, erro
 		if i < f.DataShards {
 			origLen = uint16(len(payloads[i]))
 		}
-		out[i] = buildFECPacket(group, uint8(i), uint8(f.DataShards), uint8(f.ParityShards), origLen, s)
+		out[i] = buildFECPacket(macKey, group, uint8(i), uint8(f.DataShards), uint8(f.ParityShards), origLen, s)
 	}
 
 	return out, nil
@@ -206,14 +257,16 @@ type FECHeader struct {
 	OrigLen      uint16
 }
 
-func buildFECPacket(group uint32, shardIndex uint8, dataShards uint8, parityShards uint8, origLen uint16, shard []byte) []byte {
+func buildFECPacket(macKey []byte, group uint32, shardIndex uint8, dataShards uint8, parityShards uint8, origLen uint16, shard []byte) []byte {
 	out := make([]byte, FECHeaderSize+len(shard))
 	out[0] = FECVersion
-	binary.BigEndian.PutUint32(out[1:5], group)
-	out[5] = shardIndex
-	out[6] = dataShards
-	out[7] = parityShards
-	binary.BigEndian.PutUint16(out[8:10], origLen)
+	copy(out[1:1+fecMacSize], fecTag(macKey, group, shardIndex, dataShards, parityShards, origLen, shard))
+	fieldsOff := 1 + fecMacSize
+	binary.BigEndian.PutUint32(out[fieldsOff:fieldsOff+4], group)
+	out[fieldsOff+4] = shardIndex
+	out[fieldsOff+5] = dataShards
+	out[fieldsOff+6] = parityShards
+	binary.BigEndian.PutUint16(out[fieldsOff+7:fieldsOff+9], origLen)
 	copy(out[FECHeaderSize:], shard)
 	return out
 }
@@ -223,10 +276,13 @@ func IsFECPacket(b []byte) bool {
 	return len(b) >= FECHeaderSize && b[0] == FECVersion
 }
 
-// ParseFECHeader parses the FEC header from a received packet and returns it
-// along with the remaining shard payload (the RS-coded content, still
-// carrying its embedded 2-byte length prefix).
-func ParseFECHeader(b []byte) (*FECHeader, []byte, error) {
+// ParseFECHeader verifies the HMAC tag (keyed by macKey) and parses the FEC
+// header from a received packet, returning it along with the remaining
+// shard payload (the RS-coded content, still carrying its embedded 2-byte
+// length prefix). A missing/wrong-key/forged tag is indistinguishable from
+// network corruption from the caller's point of view - both are just
+// rejected - mirroring ParseKCPPacket's contract exactly.
+func ParseFECHeader(macKey []byte, b []byte) (*FECHeader, []byte, error) {
 	if len(b) < FECHeaderSize {
 		return nil, nil, fmt.Errorf("fec: packet too short for fec header: %d bytes", len(b))
 	}
@@ -234,15 +290,27 @@ func ParseFECHeader(b []byte) (*FECHeader, []byte, error) {
 		return nil, nil, fmt.Errorf("fec: unsupported fec version %d", b[0])
 	}
 
-	h := &FECHeader{
-		Group:        binary.BigEndian.Uint32(b[1:5]),
-		ShardIndex:   b[5],
-		DataShards:   b[6],
-		ParityShards: b[7],
-		OrigLen:      binary.BigEndian.Uint16(b[8:10]),
+	fieldsOff := 1 + fecMacSize
+	group := binary.BigEndian.Uint32(b[fieldsOff : fieldsOff+4])
+	shardIndex := b[fieldsOff+4]
+	dataShards := b[fieldsOff+5]
+	parityShards := b[fieldsOff+6]
+	origLen := binary.BigEndian.Uint16(b[fieldsOff+7 : fieldsOff+9])
+	content := b[FECHeaderSize:]
+
+	if !hmac.Equal(b[1:1+fecMacSize], fecTag(macKey, group, shardIndex, dataShards, parityShards, origLen, content)) {
+		return nil, nil, fmt.Errorf("fec: invalid packet tag")
 	}
 
-	return h, b[FECHeaderSize:], nil
+	h := &FECHeader{
+		Group:        group,
+		ShardIndex:   shardIndex,
+		DataShards:   dataShards,
+		ParityShards: parityShards,
+		OrigLen:      origLen,
+	}
+
+	return h, content, nil
 }
 
 // fecShardSize is the fixed length of a shard's RS-coded content (the part
@@ -296,6 +364,7 @@ type FECSender struct {
 	cfg      *FECConfig
 	adaptive *fecConfigCache
 	resolve  func(destKey string) (dataShards, parityShards int, ok bool)
+	macKey   []byte
 	mu       sync.Mutex
 	state    map[string]*fecSendGroup
 }
@@ -307,9 +376,10 @@ type fecSendGroup struct {
 	filled int
 }
 
-// NewFECSender creates a sender-side buffer for the given FEC parameters.
-func NewFECSender(cfg *FECConfig) *FECSender {
-	return &FECSender{cfg: cfg, state: make(map[string]*fecSendGroup)}
+// NewFECSender creates a sender-side buffer for the given FEC parameters,
+// authenticating every packet it builds with macKey (see deriveFECMacKey).
+func NewFECSender(cfg *FECConfig, macKey []byte) *FECSender {
+	return &FECSender{cfg: cfg, macKey: macKey, state: make(map[string]*fecSendGroup)}
 }
 
 // NewAdaptiveFECSender creates a sender that encodes each destination with
@@ -318,8 +388,8 @@ func NewFECSender(cfg *FECConfig) *FECSender {
 // so a reply to an FEC-using client is encoded with that client's own
 // -fec-data/-fec-parity choice (which resolve looks up from what was last
 // observed on packets received from that same destKey).
-func NewAdaptiveFECSender(resolve func(destKey string) (dataShards, parityShards int, ok bool)) *FECSender {
-	return &FECSender{adaptive: newFECConfigCache(), resolve: resolve, state: make(map[string]*fecSendGroup)}
+func NewAdaptiveFECSender(resolve func(destKey string) (dataShards, parityShards int, ok bool), macKey []byte) *FECSender {
+	return &FECSender{adaptive: newFECConfigCache(), resolve: resolve, macKey: macKey, state: make(map[string]*fecSendGroup)}
 }
 
 // WrapData assigns payload the next (group, shardIndex) slot for destKey and
@@ -372,10 +442,10 @@ func (s *FECSender) WrapData(destKey string, payload []byte) (framed []byte, par
 	g.shards[idx] = cp
 	g.filled++
 
-	framed = buildFECPacket(g.group, uint8(idx), uint8(cfg.DataShards), uint8(cfg.ParityShards), uint16(len(payload)), content)
+	framed = buildFECPacket(s.macKey, g.group, uint8(idx), uint8(cfg.DataShards), uint8(cfg.ParityShards), uint16(len(payload)), content)
 
 	if g.filled == cfg.DataShards {
-		all, err := cfg.EncodeGroup(g.group, g.shards)
+		all, err := cfg.EncodeGroup(s.macKey, g.group, g.shards)
 		if err != nil {
 			loggo.Error("FECSender EncodeGroup error dest %s group %d: %s", destKey, g.group, err)
 		} else {
@@ -422,14 +492,24 @@ type fecRecvGroup struct {
 type FECReceiver struct {
 	cfg      *FECConfig
 	adaptive *fecConfigCache
+	macKey   []byte
 	mu       sync.Mutex
 	state    map[string]*fecRecvGroup
 }
 
 // NewFECReceiver creates a receiver-side reassembly buffer for the given FEC
-// parameters.
-func NewFECReceiver(cfg *FECConfig) *FECReceiver {
-	return &FECReceiver{cfg: cfg, state: make(map[string]*fecRecvGroup)}
+// parameters, verifying every packet's tag against macKey (see
+// deriveFECMacKey) before it's ever fed to Feed.
+func NewFECReceiver(cfg *FECConfig, macKey []byte) *FECReceiver {
+	return &FECReceiver{cfg: cfg, macKey: macKey, state: make(map[string]*fecRecvGroup)}
+}
+
+// ParseHeader verifies and parses one received FEC packet using this
+// receiver's own macKey - mirrors KCPTransport.ParsePacket exactly, so
+// callers never need to reach for the standalone ParseFECHeader/macKey pair
+// directly.
+func (r *FECReceiver) ParseHeader(b []byte) (*FECHeader, []byte, error) {
+	return ParseFECHeader(r.macKey, b)
 }
 
 // NewAdaptiveFECReceiver creates a receiver that accepts any FEC parameters
@@ -437,8 +517,8 @@ func NewFECReceiver(cfg *FECConfig) *FECReceiver {
 // single preconfigured shard count. Used by a server that was not pinned to
 // -fec, so each connecting client's own -fec-data/-fec-parity choice is
 // honored automatically rather than having to match a fixed server setting.
-func NewAdaptiveFECReceiver() *FECReceiver {
-	return &FECReceiver{adaptive: newFECConfigCache(), state: make(map[string]*fecRecvGroup)}
+func NewAdaptiveFECReceiver(macKey []byte) *FECReceiver {
+	return &FECReceiver{adaptive: newFECConfigCache(), macKey: macKey, state: make(map[string]*fecRecvGroup)}
 }
 
 // Feed processes one received FEC packet (already header-parsed) for

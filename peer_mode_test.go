@@ -58,7 +58,7 @@ func TestServerPeerTransportPinnedModeIgnoresTracker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFECConfig: %v", err)
 	}
-	pinnedFEC := NewFECSender(cfg)
+	pinnedFEC := NewFECSender(cfg, []byte("test-mac-key"))
 
 	s := &Server{fecSender: pinnedFEC, peerModes: nil}
 	fecSender, kcpTransport := s.peerTransport(nil, 1)
@@ -80,7 +80,7 @@ func TestServerPeerTransportAdaptiveModeFollowsTracker(t *testing.T) {
 	tracker.Observe("5.6.7.8|20", PeerModeKCP, 0, 0)
 	// "9.9.9.9|30" deliberately left unobserved: a brand new peer.
 
-	fecSender := NewAdaptiveFECSender(tracker.FECParams)
+	fecSender := NewAdaptiveFECSender(tracker.FECParams, []byte("test-mac-key"))
 	kcpTransport := NewKCPTransport(DefaultKCPConfig(), nil, nil)
 	defer kcpTransport.Close()
 

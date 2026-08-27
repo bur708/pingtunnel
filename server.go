@@ -21,13 +21,14 @@ func NewServer(icmpAddr string, key int, maxconn int, maxprocessthread int, maxp
 	var fecSender *FECSender
 	var fecReceiver *FECReceiver
 	var peerModes *PeerModeTracker
+	fecMacKey := deriveFECMacKey(cryptoConfig, key)
 
 	switch {
 	case fecConfig != nil:
 		// Pinned to FEC (-fec was given): every peer must match these
 		// exact shard counts, same as before adaptive mode existed.
-		fecSender = NewFECSender(fecConfig)
-		fecReceiver = NewFECReceiver(fecConfig)
+		fecSender = NewFECSender(fecConfig, fecMacKey)
+		fecReceiver = NewFECReceiver(fecConfig, fecMacKey)
 	case kcpConfig != nil:
 		// Pinned to KCP (-kcp was given): no FEC involvement, unchanged.
 	default:
@@ -38,8 +39,8 @@ func NewServer(icmpAddr string, key int, maxconn int, maxprocessthread int, maxp
 		// superset of the old flagless default (plain-only): a peer that
 		// sends plain traffic still gets plain replies.
 		peerModes = NewPeerModeTracker()
-		fecReceiver = NewAdaptiveFECReceiver()
-		fecSender = NewAdaptiveFECSender(peerModes.FECParams)
+		fecReceiver = NewAdaptiveFECReceiver(fecMacKey)
+		fecSender = NewAdaptiveFECSender(peerModes.FECParams, fecMacKey)
 		kcpConfig = DefaultKCPConfig()
 		loggo.Info("neither -fec nor -kcp set: running adaptively, matching each client's own reliability mode automatically")
 	}
