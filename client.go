@@ -355,6 +355,35 @@ func (p *Client) Run() error {
 	}
 	p.conn = conn
 
+	// On Android (icmpDatagram - see icmp_listen_android.go), we don't have
+	// a real raw socket: listenICMP falls back to an unprivileged "ping"
+	// socket (SOCK_DGRAM+IPPROTO_ICMP), and Linux's ping protocol handler
+	// overwrites the ICMP echo Identifier of every outgoing packet with
+	// that socket's own bound local port - completely ignoring whatever
+	// value this project's own writeICMP puts in the packet. processPacket
+	// already knew this (see its "!icmpDatagram && packet.echoId != p.id"
+	// check, which has always skipped echoId validation on Android) but
+	// nothing propagated that awareness to the KCP layer: kcpFlowID's
+	// destKey/sessionKey still used the random p.id chosen at construction
+	// for both directions, which never matched what the kernel actually put
+	// on the wire - live-tested 2026-08-27: every reply the server sent
+	// arrived tagged with the kernel's real ident (observed consistently
+	// across an entire session, e.g. 1640, 1639, 1638 in successive runs -
+	// never once the app's own randomized p.id), so recvICMP's session
+	// lookup (keyed on the wrong p.id) never matched the session that sent
+	// the request, and every single reply was treated as an unsolicited
+	// push into a brand-new reactive session instead of the one actually
+	// waiting for it. Overriding p.id here, once, to the real bound port
+	// before anything sends or builds a session key fixes this at the
+	// source instead of patching every consumer.
+	if icmpDatagram {
+		if udpAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok && udpAddr.Port > 0 {
+			loggo.Info("DIAG CLIENTID Android ping-socket: overriding randomized id %d with actual kernel-assigned ident (bound port) %d", p.id, udpAddr.Port)
+			p.id = udpAddr.Port
+		}
+	}
+	loggo.Info("DIAG CLIENTID this client's own effective ICMP echo id is %d", p.id)
+
 	if p.tcpmode > 0 {
 		tcplistenConn, err := net.ListenTCP("tcp", p.tcpaddr)
 		if err != nil {
