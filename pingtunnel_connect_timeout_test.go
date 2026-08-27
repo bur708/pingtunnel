@@ -38,7 +38,7 @@ func TestNewClientConnectTimeoutFallsBackWhenZero(t *testing.T) {
 }
 
 func TestNewServerConnectTimeout(t *testing.T) {
-	s, err := NewServer("0.0.0.0", 1, 0, 0, 0, 3000, nil, nil, nil, nil, 20, 0, 0, 0)
+	s, err := NewServer("0.0.0.0", 1, 0, 0, 0, 3000, nil, nil, nil, nil, 20, 0, 0, 0, false)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -48,7 +48,7 @@ func TestNewServerConnectTimeout(t *testing.T) {
 }
 
 func TestNewServerConnectTimeoutFallsBackWhenZero(t *testing.T) {
-	s, err := NewServer("0.0.0.0", 1, 0, 0, 0, 3000, nil, nil, nil, nil, 0, 0, 0, 0)
+	s, err := NewServer("0.0.0.0", 1, 0, 0, 0, 3000, nil, nil, nil, nil, 0, 0, 0, 0, false)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -63,7 +63,7 @@ func TestNewServerConnectTimeoutFallsBackWhenZero(t *testing.T) {
 // high-bandwidth-delay-product link (e.g. satellite) - these flags must not
 // be silently ignored just because no -kcp/-fec was pinned.
 func TestNewServerAdaptiveModeAppliesKCPWindowOverrides(t *testing.T) {
-	s, err := NewServer("0.0.0.0", 1, 0, 0, 0, 3000, nil, nil, nil, nil, 0, 0, 1024, 2048)
+	s, err := NewServer("0.0.0.0", 1, 0, 0, 0, 3000, nil, nil, nil, nil, 0, 0, 1024, 2048, false)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
@@ -81,11 +81,35 @@ func TestNewServerAdaptiveModeAppliesKCPWindowOverrides(t *testing.T) {
 // Companion: passing 0 (the flag default, meaning "not overridden") must
 // leave the built-in default window size intact rather than zeroing it out.
 func TestNewServerAdaptiveModeKeepsDefaultWindowWhenOverrideIsZero(t *testing.T) {
-	s, err := NewServer("0.0.0.0", 1, 0, 0, 0, 3000, nil, nil, nil, nil, 0, 0, 0, 0)
+	s, err := NewServer("0.0.0.0", 1, 0, 0, 0, 3000, nil, nil, nil, nil, 0, 0, 0, 0, false)
 	if err != nil {
 		t.Fatalf("NewServer: %v", err)
 	}
 	if s.kcpConfig.SndWnd != 256 || s.kcpConfig.RcvWnd != 256 {
 		t.Fatalf("expected default 256/256 window when overrides are 0, got sndwnd=%d rcvwnd=%d", s.kcpConfig.SndWnd, s.kcpConfig.RcvWnd)
+	}
+}
+
+// Regression test for -kcp-congestion: NoCongestion defaults to 1 (kcp-go's
+// built-in TCP-Reno-style congestion control disabled, matching this
+// project's original behavior) unless explicitly requested, including in
+// adaptive mode - same reasoning as the window-override tests above.
+func TestNewServerAdaptiveModeAppliesCongestionControlFlag(t *testing.T) {
+	s, err := NewServer("0.0.0.0", 1, 0, 0, 0, 3000, nil, nil, nil, nil, 0, 0, 0, 0, true)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	if s.kcpConfig.NoCongestion != 0 {
+		t.Fatalf("expected -kcp-congestion=true to set NoCongestion=0, got %d", s.kcpConfig.NoCongestion)
+	}
+}
+
+func TestNewServerAdaptiveModeKeepsCongestionDisabledByDefault(t *testing.T) {
+	s, err := NewServer("0.0.0.0", 1, 0, 0, 0, 3000, nil, nil, nil, nil, 0, 0, 0, 0, false)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	if s.kcpConfig.NoCongestion != 1 {
+		t.Fatalf("expected NoCongestion=1 (unchanged default) when -kcp-congestion is false, got %d", s.kcpConfig.NoCongestion)
 	}
 }

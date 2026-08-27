@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-func NewServer(icmpAddr string, key int, maxconn int, maxprocessthread int, maxprocessbuffer int, connecttmeout int, cryptoConfig *CryptoConfig, forwardConfig *ForwardConfig, fecConfig *FECConfig, kcpConfig *KCPConfig, connectHandshakeTimeoutSec int, maxPPS int, kcpSndWnd int, kcpRcvWnd int) (*Server, error) {
+func NewServer(icmpAddr string, key int, maxconn int, maxprocessthread int, maxprocessbuffer int, connecttmeout int, cryptoConfig *CryptoConfig, forwardConfig *ForwardConfig, fecConfig *FECConfig, kcpConfig *KCPConfig, connectHandshakeTimeoutSec int, maxPPS int, kcpSndWnd int, kcpRcvWnd int, kcpCongestion bool) (*Server, error) {
 	if connectHandshakeTimeoutSec <= 0 {
 		connectHandshakeTimeoutSec = 5
 	}
@@ -51,6 +51,9 @@ func NewServer(icmpAddr string, key int, maxconn int, maxprocessthread int, maxp
 		}
 		if kcpRcvWnd > 0 {
 			kcpConfig.RcvWnd = kcpRcvWnd
+		}
+		if kcpCongestion {
+			kcpConfig.NoCongestion = 0
 		}
 		loggo.Info("neither -fec nor -kcp set: running adaptively, matching each client's own reliability mode automatically")
 	}

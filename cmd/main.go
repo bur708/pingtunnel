@@ -175,6 +175,7 @@ func main() {
 	kcpFlag := flag.Bool("kcp", false, "use KCP (reliable ARQ) instead of the default resend logic for this tunnel; cannot be combined with -fec")
 	kcpSndWnd := flag.Int("kcp-sndwnd", 0, "KCP send window, in segments (0 = built-in default, 256). Raise this for high-bandwidth-delay-product links (e.g. a fast but high-latency satellite link like Starlink) where the default window can't keep enough data in flight to fill the real link capacity. Applies both when -kcp is pinned and to the server's adaptive per-peer KCP sessions")
 	kcpRcvWnd := flag.Int("kcp-rcvwnd", 0, "KCP receive window, in segments (0 = built-in default, 256) - see -kcp-sndwnd")
+	kcpCongestion := flag.Bool("kcp-congestion", false, "enable KCP's built-in TCP-Reno-style congestion control (kcp-go's cwnd/ssthresh: slow start, additive increase, multiplicative decrease on loss) instead of blasting up to the static send window regardless of observed loss/RTT. Off by default (matches this project's original behavior, chosen when this project was tuned for a narrow-but-not-shared link); worth trying on a bandwidth-constrained or shared link (e.g. real satellite) where an uncontrolled static window can cause self-inflicted congestion")
 	tcpmode := flag.Int("tcp", 0, "tcp mode")
 	tcpmode_buffersize := flag.Int("tcp_bs", 1*1024*1024, "tcp mode buffer size")
 	tcpmode_maxwin := flag.Int("tcp_mw", 20000, "tcp mode max win")
@@ -277,6 +278,9 @@ func main() {
 		if *kcpRcvWnd > 0 {
 			kcpConfig.RcvWnd = *kcpRcvWnd
 		}
+		if *kcpCongestion {
+			kcpConfig.NoCongestion = 0
+		}
 	}
 
 	level := loggo.LEVEL_INFO
@@ -323,7 +327,7 @@ func main() {
 			loggo.Info("Forward proxy configured: %s", *forward)
 		}
 
-		s, err := pingtunnel.NewServer(*icmpListen, *key, *maxconn, *max_process_thread, *max_process_buffer, *conntt, cryptoConfig, forwardConfig, fecConfig, kcpConfig, *connectTimeout, *maxPPS, *kcpSndWnd, *kcpRcvWnd)
+		s, err := pingtunnel.NewServer(*icmpListen, *key, *maxconn, *max_process_thread, *max_process_buffer, *conntt, cryptoConfig, forwardConfig, fecConfig, kcpConfig, *connectTimeout, *maxPPS, *kcpSndWnd, *kcpRcvWnd, *kcpCongestion)
 		if err != nil {
 			loggo.Error("ERROR: %s", err.Error())
 			return
