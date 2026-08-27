@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/esrrhs/gohome/loggo"
 	kcp "github.com/xtaci/kcp-go"
 )
 
@@ -209,6 +210,13 @@ func DefaultKCPConfig() *KCPConfig {
 		SndWnd:       256,
 		RcvWnd:       256,
 		MTU:          FECMaxPayload, // keep KCP segments within the same safe budget FEC uses
+		// A real device tunnels far more than just the user's own traffic
+		// (background app/ad-SDK chatter shares the same session/bucket -
+		// live-tested 2026-08-27: 25-86 concurrent flows), so the default
+		// 4x-SndWnd backlog cap (1024) was routinely maxed out, silently
+		// dropping new messages - including the user's own DNS lookups -
+		// well before the real link's throughput was the limiting factor.
+		MaxWaitSnd: 4096,
 	}
 }
 
@@ -264,6 +272,17 @@ type KCPSession struct {
 	// KCPTransport's idle reaper - see kcpSessionIdleTimeout.
 	lastActivityUnixNano atomic.Int64
 
+	// createdUnixNano and lastRecvUnixNano (0 until the first Input call)
+	// back the deadlock detector - see isDeadlocked's doc comment. Unlike
+	// lastActivityUnixNano, lastRecvUnixNano is deliberately NOT touched by
+	// Send: a session can have Send called on it forever (e.g. one shared
+	// bucket - see kcpFlowID - keeps receiving new unrelated flows' traffic)
+	// while never once hearing back from the peer, and that distinction is
+	// exactly what the idle reaper (keyed on lastActivityUnixNano) cannot
+	// see.
+	createdUnixNano  int64
+	lastRecvUnixNano atomic.Int64
+
 	// TEMP forensic instrumentation for the 2026-08-24 KCP/DNS investigation,
 	// populated by the write-site capture in pingtunnel.go (sendICMP/recvICMP's
 	// sendRaw closures) immediately after the real conn.WriteTo call. Not read
@@ -310,6 +329,49 @@ func (s *KCPSession) touchActivity() {
 	s.lastActivityUnixNano.Store(time.Now().UnixNano())
 }
 
+// kcpDeadlockTimeout bounds how long a session may keep an outstanding send
+// backlog (kcp.KCP.WaitSnd() > 0) without ever once hearing back from the
+// peer (Input never called) before isDeadlocked reports it dead. kcp-go
+// itself detects this internally (segment.xmit >= dead_link, kcp.go:831)
+// but only sets an unexported state field nothing else in the vendored
+// library or this project ever reads - live-tested 2026-08-27: a session
+// wedged this way (its very first exchange corrupted by the ICMP-reflection
+// mechanism 5eedf7c guards against - or by a rejected/uninitiated peer that
+// never replies) retransmits forever, and because kcpFlowID buckets many
+// unrelated flows onto one session, every new flow hashed into that same
+// bucket keeps calling Send - which touches lastActivityUnixNano - so the
+// existing idle reaper (kcpSessionIdleTimeout) never fires; one bad bucket
+// stayed permanently wedged and silently ate roughly 1/kcpFlowBuckets of
+// all traffic through it. 10s comfortably outlives any real round trip
+// (including the artificial ~60ms RTT this was verified under) while still
+// recovering promptly.
+const kcpDeadlockTimeout = 10 * time.Second
+
+func (s *KCPSession) touchRecv() {
+	s.lastRecvUnixNano.Store(time.Now().UnixNano())
+}
+
+// isDeadlocked reports whether this session has an outstanding send backlog
+// but has never once received anything from the peer, for at least
+// kcpDeadlockTimeout since creation - see kcpDeadlockTimeout's doc comment.
+// A session that has received at least one real reply is never considered
+// deadlocked by this check, no matter how stale: ordinary loss/recovery is
+// already handled by KCP's own retransmit logic and Send's backpressure
+// timeout, and conflating the two would risk killing a healthy-but-quiet
+// session.
+func (s *KCPSession) isDeadlocked(now time.Time) bool {
+	if s.lastRecvUnixNano.Load() != 0 {
+		return false
+	}
+	if now.Sub(time.Unix(0, s.createdUnixNano)) < kcpDeadlockTimeout {
+		return false
+	}
+	s.mu.Lock()
+	waiting := s.engine.WaitSnd()
+	s.mu.Unlock()
+	return waiting > 0
+}
+
 // NewKCPSession creates a session and starts its background update loop.
 // Call Close when done to stop that goroutine.
 func NewKCPSession(cfg *KCPConfig, sendRaw func(segment []byte)) *KCPSession {
@@ -322,6 +384,7 @@ func NewKCPSession(cfg *KCPConfig, sendRaw func(segment []byte)) *KCPSession {
 		exit: make(chan struct{}),
 	}
 	s.touchActivity()
+	s.createdUnixNano = time.Now().UnixNano()
 
 	s.engine = kcp.NewKCP(kcpConv, func(buf []byte, size int) {
 		outputStart := time.Now()
@@ -474,6 +537,7 @@ func (s *KCPSession) waitForRoom() error {
 // update tick.
 func (s *KCPSession) Input(pkt []byte) {
 	s.touchActivity()
+	s.touchRecv()
 
 	s.mu.Lock()
 	s.engine.Input(pkt, true, false)
@@ -583,15 +647,29 @@ func (t *KCPTransport) reapIdle() {
 	now := time.Now()
 	t.mu.Lock()
 	var idle []*KCPSession
+	var deadlocked []*KCPSession
 	for destKey, s := range t.sessions {
-		if now.Sub(s.lastActivity()) >= kcpSessionIdleTimeout {
+		switch {
+		case now.Sub(s.lastActivity()) >= kcpSessionIdleTimeout:
 			idle = append(idle, s)
+			delete(t.sessions, destKey)
+		case s.isDeadlocked(now):
+			// Still "active" (Send keeps getting called - see
+			// isDeadlocked's doc comment) so the idle branch above never
+			// catches this; close and drop it here instead so the next
+			// Send/Input for this destKey starts a fresh session rather
+			// than piling onto one that can never make progress.
+			deadlocked = append(deadlocked, s)
 			delete(t.sessions, destKey)
 		}
 	}
 	t.mu.Unlock()
 
 	for _, s := range idle {
+		s.Close()
+	}
+	for _, s := range deadlocked {
+		loggo.Info("kcp session deadlocked (never received anything from peer after %s with a pending backlog), closing so a fresh session can take over", kcpDeadlockTimeout)
 		s.Close()
 	}
 }

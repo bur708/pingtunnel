@@ -212,11 +212,20 @@ func (r *sock5UDPRelay) close() {
 
 // sock5UDPOutstandingGrace bounds how long a ClientConn is kept routable
 // after its relay's control connection has already closed while a reply
-// was still in flight. This is a lifecycle safety net (long enough to
-// cover a real KCP round trip with margin, e.g. the ~12ms measured in
-// production), not a protocol timeout, and is deliberately not tied to any
-// particular external caller's own retry timing.
-const sock5UDPOutstandingGrace = 1500 * time.Millisecond
+// was still in flight. This is a lifecycle safety net, not a protocol
+// timeout, and is deliberately not tied to any particular external caller's
+// own retry timing.
+//
+// Raised from 1500ms to 8s 2026-08-27 as a live diagnostic: the original
+// 1500ms was sized for the ~12ms RTT measured for an already-synced
+// session, but a brand-new session's first exchange (delayed by the
+// ICMP-reflection guard - see isEchoReplyReflection - plus at least one
+// real KCP resend cycle) can take much longer, and DNS lookups were still
+// failing almost entirely even after the zombie-session reaper fix, with
+// every replacement session also failing its own first exchange. Testing
+// whether this relay simply closing before that slower first round trip
+// completes - not the session logic itself - is the actual bottleneck.
+const sock5UDPOutstandingGrace = 8000 * time.Millisecond
 
 func (p *Client) Addr() string {
 	return p.addr

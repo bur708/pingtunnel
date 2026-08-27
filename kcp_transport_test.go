@@ -546,3 +546,76 @@ func TestKCPTransportSessionCountBoundedByFlowBuckets(t *testing.T) {
 		t.Fatalf("%d simulated flows produced %d live sessions, want at most kcpFlowBuckets (%d)", simulatedFlows, sessionCount, kcpFlowBuckets)
 	}
 }
+
+// Regression test for the zombie-session bug found live-testing 2026-08-27:
+// a session whose peer never once replies (its first exchange corrupted by
+// the ICMP-reflection mechanism 5eedf7c guards against, or simply an
+// unreachable/rejecting peer) retransmits its backlog forever. Because
+// kcpFlowID buckets many unrelated flows onto one session, every new flow
+// hashed into that same bucket keeps calling Send - which touches
+// lastActivityUnixNano - so the pre-existing idle reaper (keyed on exactly
+// that timestamp) never fires and the bucket stays permanently wedged,
+// silently eating roughly 1/kcpFlowBuckets of all traffic through it
+// (live-tested: ~1000+ self-reflection drops/sec, 1/616 real DNS lookups
+// succeeding). isDeadlocked must catch this even though the session looks
+// "active" by the old definition.
+func TestKCPTransportReapsDeadlockedSessions(t *testing.T) {
+	transport := NewKCPTransport(fastTestKCPConfig(), nil, nil)
+	defer transport.Close()
+
+	wedged := transport.Session("wedged-flow", nil, 0, func(segment []byte) {
+		// Black hole: the peer never replies, so WaitSnd never drains and
+		// Input is never called - exactly the confirmed live symptom.
+	})
+	// Keep the backlog non-empty so isDeadlocked's WaitSnd()>0 check holds.
+	if err := wedged.Send([]byte("first message, never acked")); err != nil {
+		t.Fatalf("unexpected Send error priming the backlog: %v", err)
+	}
+	// New unrelated flows keep landing in the same bucket and calling Send,
+	// refreshing lastActivityUnixNano - simulate that so the test actually
+	// exercises the "looks active" case, not just an idle one.
+	wedged.touchActivity()
+	wedged.createdUnixNano = time.Now().Add(-2 * kcpDeadlockTimeout).UnixNano()
+
+	transport.reapIdle()
+
+	transport.mu.Lock()
+	_, stillTracked := transport.sessions["wedged-flow"]
+	transport.mu.Unlock()
+
+	if stillTracked {
+		t.Fatal("expected the deadlocked session to be reaped despite looking recently-active")
+	}
+	select {
+	case <-wedged.Done():
+	default:
+		t.Fatal("expected the deadlocked session to be Close'd (Done channel closed)")
+	}
+}
+
+// Companion to the above: a session that has received at least one real
+// reply must never be torn down by isDeadlocked, no matter how stale or how
+// large its backlog - that's ordinary loss/recovery, already handled by
+// KCP's own retransmit logic and Send's backpressure timeout.
+func TestKCPTransportDoesNotReapSessionThatHasReceivedSomething(t *testing.T) {
+	transport := NewKCPTransport(fastTestKCPConfig(), nil, nil)
+	defer transport.Close()
+
+	healthy := transport.Session("healthy-flow", nil, 0, func(segment []byte) {})
+	if err := healthy.Send([]byte("message needing an ack")); err != nil {
+		t.Fatalf("unexpected Send error: %v", err)
+	}
+	healthy.Input([]byte{0, 0, 0, 0}) // garbage is fine - Input touches lastRecvUnixNano unconditionally
+	healthy.touchActivity()
+	healthy.createdUnixNano = time.Now().Add(-2 * kcpDeadlockTimeout).UnixNano()
+
+	transport.reapIdle()
+
+	transport.mu.Lock()
+	_, stillTracked := transport.sessions["healthy-flow"]
+	transport.mu.Unlock()
+
+	if !stillTracked {
+		t.Fatal("expected a session that has received something to survive reaping regardless of backlog/age")
+	}
+}

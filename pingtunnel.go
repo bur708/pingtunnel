@@ -268,6 +268,8 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, 
 		// ourselves just sent as a Request, so this never affects real
 		// traffic (including real Echo Replies from the peer).
 		if bytes[0] == icmpEchoReplyType && isEchoReplyReflection(bytes[:n]) {
+			loggo.Info("DIAG REFLECTION dropped inbound echo reply as self-reflection, id=%d seq=%d bytes=%d peer=%v",
+				int(binary.BigEndian.Uint16(bytes[4:6])), int(binary.BigEndian.Uint16(bytes[6:8])), n, icmpSrcToIPAddr(srcaddr))
 			continue
 		}
 
