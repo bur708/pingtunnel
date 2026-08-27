@@ -19,7 +19,7 @@ func sendICMP(id int, sequence int, conn icmp.PacketConn, server *net.IPAddr, ta
 	tcpmode int, tcpmode_buffer_size int, tcpmode_maxwin int, tcpmode_resend_time int, tcpmode_compress int, tcpmode_stat int,
 	timeout int, cryptoConfig *CryptoConfig, fecSender *FECSender, kcpTransport *KCPTransport, rateLimiter *RateLimiter) {
 	if diagIsDNS(target, data) {
-		loggo.Info("DIAG DNS endpoint=%s stage=pingtunnel_send conn=%s target=%s %s selected=%s", diagEndpoint(sproto), connId, target, diagDNS(data), func() string {
+		loggo.Debug("DIAG DNS endpoint=%s stage=pingtunnel_send conn=%s target=%s %s selected=%s", diagEndpoint(sproto), connId, target, diagDNS(data), func() string {
 			if kcpTransport != nil {
 				return "kcp"
 			}
@@ -179,7 +179,36 @@ const echoReflectionWindow = 500 * time.Millisecond
 var (
 	recentEchoRequestsMu sync.Mutex
 	recentEchoRequests   = make(map[string]time.Time)
+	// recentEchoRequestsCleanupOnce lazily starts recentEchoRequestsCleanupLoop
+	// on the first send, rather than unconditionally at package init, so a
+	// build/binary that never sends an Echo Request (e.g. server-only,
+	// which never calls rememberEchoRequest - see its call site's comment)
+	// never spends a goroutine on this at all.
+	recentEchoRequestsCleanupOnce sync.Once
 )
+
+// recentEchoRequestsCleanupLoop periodically sweeps expired entries out of
+// recentEchoRequests, so rememberEchoRequest itself (on this project's
+// per-packet send hot path - live-tested load: on the order of thousands of
+// sends/sec) never has to do an O(map size) scan inline. Correctness
+// doesn't depend on how promptly this runs: isEchoReplyReflection already
+// re-checks each entry's age itself, so a stale-but-not-yet-swept entry is
+// simply never treated as a match - this loop only bounds how large the map
+// grows between sweeps, which is a memory concern, not a correctness one.
+func recentEchoRequestsCleanupLoop() {
+	ticker := time.NewTicker(echoReflectionWindow)
+	defer ticker.Stop()
+	for range ticker.C {
+		now := time.Now()
+		recentEchoRequestsMu.Lock()
+		for k, t := range recentEchoRequests {
+			if now.Sub(t) > echoReflectionWindow {
+				delete(recentEchoRequests, k)
+			}
+		}
+		recentEchoRequestsMu.Unlock()
+	}
+}
 
 // rememberEchoRequest records the ID/sequence/payload (i.e. everything an
 // ICMP message carries except Type/Code/Checksum) of an Echo Request we
@@ -195,15 +224,10 @@ func rememberEchoRequest(icmpBytes []byte) {
 	if len(icmpBytes) < 8 {
 		return
 	}
+	recentEchoRequestsCleanupOnce.Do(func() { go recentEchoRequestsCleanupLoop() })
 	key := string(icmpBytes[4:])
-	now := time.Now()
 	recentEchoRequestsMu.Lock()
-	recentEchoRequests[key] = now
-	for k, t := range recentEchoRequests {
-		if now.Sub(t) > echoReflectionWindow {
-			delete(recentEchoRequests, k)
-		}
-	}
+	recentEchoRequests[key] = time.Now()
 	recentEchoRequestsMu.Unlock()
 }
 
@@ -268,7 +292,7 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, 
 		// ourselves just sent as a Request, so this never affects real
 		// traffic (including real Echo Replies from the peer).
 		if bytes[0] == icmpEchoReplyType && isEchoReplyReflection(bytes[:n]) {
-			loggo.Info("DIAG REFLECTION dropped inbound echo reply as self-reflection, id=%d seq=%d bytes=%d peer=%v",
+			loggo.Debug("DIAG REFLECTION dropped inbound echo reply as self-reflection, id=%d seq=%d bytes=%d peer=%v",
 				int(binary.BigEndian.Uint16(bytes[4:6])), int(binary.BigEndian.Uint16(bytes[6:8])), n, icmpSrcToIPAddr(srcaddr))
 			continue
 		}
@@ -368,7 +392,7 @@ func deliverPayload(mb []byte, cryptoConfig *CryptoConfig, recv chan<- *Packet, 
 		return
 	}
 	if diagIsDNS(my.Target, my.Data) {
-		loggo.Info("DIAG DNS endpoint=%s stage=pingtunnel_decoded conn=%s target=%s %s echo=%d peer=%v", diagDecodedEndpoint(my.Rproto), my.Id, my.Target, diagDNS(my.Data), echoId, src)
+		loggo.Debug("DIAG DNS endpoint=%s stage=pingtunnel_decoded conn=%s target=%s %s echo=%d peer=%v", diagDecodedEndpoint(my.Rproto), my.Id, my.Target, diagDNS(my.Data), echoId, src)
 	}
 
 	recv <- &Packet{my: my, src: src, echoId: echoId, echoSeq: echoSeq}

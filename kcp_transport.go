@@ -542,7 +542,7 @@ func (s *KCPSession) waitForRoom() error {
 // update tick.
 func (s *KCPSession) Input(pkt []byte) {
 	if s.lastRecvUnixNano.Load() == 0 {
-		loggo.Info("DIAG FIRSTRECV destKey=%s bytes=%d", s.destKey, len(pkt))
+		loggo.Debug("DIAG FIRSTRECV destKey=%s bytes=%d", s.destKey, len(pkt))
 	}
 	s.touchActivity()
 	s.touchRecv()
@@ -707,7 +707,7 @@ func (t *KCPTransport) Session(destKey string, peer *net.IPAddr, id int, sendRaw
 		t.mu.Unlock()
 		return s
 	}
-	loggo.Info("DIAG NEWSESSION destKey=%s peer=%v id=%d", destKey, peer, id)
+	loggo.Debug("DIAG NEWSESSION destKey=%s peer=%v id=%d", destKey, peer, id)
 	s := NewKCPSession(t.cfg, sendRaw)
 	s.destKey = destKey
 	t.sessions[destKey] = s

@@ -173,6 +173,8 @@ func main() {
 	fecData := flag.Int("fec-data", 10, "FEC data shards per block (used only when -fec is set)")
 	fecParity := flag.Int("fec-parity", 3, "FEC parity shards per block, tolerates losing up to this many packets per block of fec-data+fec-parity (used only when -fec is set)")
 	kcpFlag := flag.Bool("kcp", false, "use KCP (reliable ARQ) instead of the default resend logic for this tunnel; cannot be combined with -fec")
+	kcpSndWnd := flag.Int("kcp-sndwnd", 0, "KCP send window, in segments (0 = built-in default, 256). Raise this for high-bandwidth-delay-product links (e.g. a fast but high-latency satellite link like Starlink) where the default window can't keep enough data in flight to fill the real link capacity. Applies both when -kcp is pinned and to the server's adaptive per-peer KCP sessions")
+	kcpRcvWnd := flag.Int("kcp-rcvwnd", 0, "KCP receive window, in segments (0 = built-in default, 256) - see -kcp-sndwnd")
 	tcpmode := flag.Int("tcp", 0, "tcp mode")
 	tcpmode_buffersize := flag.Int("tcp_bs", 1*1024*1024, "tcp mode buffer size")
 	tcpmode_maxwin := flag.Int("tcp_mw", 20000, "tcp mode max win")
@@ -269,6 +271,12 @@ func main() {
 			return
 		}
 		kcpConfig = pingtunnel.DefaultKCPConfig()
+		if *kcpSndWnd > 0 {
+			kcpConfig.SndWnd = *kcpSndWnd
+		}
+		if *kcpRcvWnd > 0 {
+			kcpConfig.RcvWnd = *kcpRcvWnd
+		}
 	}
 
 	level := loggo.LEVEL_INFO
@@ -315,7 +323,7 @@ func main() {
 			loggo.Info("Forward proxy configured: %s", *forward)
 		}
 
-		s, err := pingtunnel.NewServer(*icmpListen, *key, *maxconn, *max_process_thread, *max_process_buffer, *conntt, cryptoConfig, forwardConfig, fecConfig, kcpConfig, *connectTimeout, *maxPPS)
+		s, err := pingtunnel.NewServer(*icmpListen, *key, *maxconn, *max_process_thread, *max_process_buffer, *conntt, cryptoConfig, forwardConfig, fecConfig, kcpConfig, *connectTimeout, *maxPPS, *kcpSndWnd, *kcpRcvWnd)
 		if err != nil {
 			loggo.Error("ERROR: %s", err.Error())
 			return

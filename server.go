@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-func NewServer(icmpAddr string, key int, maxconn int, maxprocessthread int, maxprocessbuffer int, connecttmeout int, cryptoConfig *CryptoConfig, forwardConfig *ForwardConfig, fecConfig *FECConfig, kcpConfig *KCPConfig, connectHandshakeTimeoutSec int, maxPPS int) (*Server, error) {
+func NewServer(icmpAddr string, key int, maxconn int, maxprocessthread int, maxprocessbuffer int, connecttmeout int, cryptoConfig *CryptoConfig, forwardConfig *ForwardConfig, fecConfig *FECConfig, kcpConfig *KCPConfig, connectHandshakeTimeoutSec int, maxPPS int, kcpSndWnd int, kcpRcvWnd int) (*Server, error) {
 	if connectHandshakeTimeoutSec <= 0 {
 		connectHandshakeTimeoutSec = 5
 	}
@@ -42,6 +42,16 @@ func NewServer(icmpAddr string, key int, maxconn int, maxprocessthread int, maxp
 		fecReceiver = NewAdaptiveFECReceiver(fecMacKey)
 		fecSender = NewAdaptiveFECSender(peerModes.FECParams, fecMacKey)
 		kcpConfig = DefaultKCPConfig()
+		// kcpSndWnd/kcpRcvWnd (-kcp-sndwnd/-kcp-rcvwnd) apply here too, not
+		// just to a pinned -kcp server, since this adaptive path is what a
+		// real deployment recommended to run without -fec/-kcp (see
+		// infra-and-access memory) actually uses for KCP-using peers.
+		if kcpSndWnd > 0 {
+			kcpConfig.SndWnd = kcpSndWnd
+		}
+		if kcpRcvWnd > 0 {
+			kcpConfig.RcvWnd = kcpRcvWnd
+		}
 		loggo.Info("neither -fec nor -kcp set: running adaptively, matching each client's own reliability mode automatically")
 	}
 
@@ -763,7 +773,7 @@ func (p *Server) Recv(conn *ServerConn, id string, src *net.IPAddr) {
 
 	bytes := make([]byte, 2000)
 	fecSender, kcpTransport := p.peerTransport(src, conn.echoId)
-	loggo.Info("DIAG PEERTRANSPORT src=%v echoId=%d fecSender=%v kcpTransport=%v", src, conn.echoId, fecSender != nil, kcpTransport != nil)
+	loggo.Debug("DIAG PEERTRANSPORT src=%v echoId=%d fecSender=%v kcpTransport=%v", src, conn.echoId, fecSender != nil, kcpTransport != nil)
 
 	for !p.exit {
 
