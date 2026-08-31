@@ -17,3 +17,9 @@
 # Built packages
 cmd/pack/
 cmd/pack.zip
+
+# Local server binary and scratch artifacts (never meant to be committed)
+/ptunnel
+/ptunnel.*
+/ptunnel_diag
+*.log

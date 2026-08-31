@@ -18,18 +18,6 @@ func sendICMP(id int, sequence int, conn icmp.PacketConn, server *net.IPAddr, ta
 	connId string, msgType uint32, data []byte, sproto int, rproto int, key int,
 	tcpmode int, tcpmode_buffer_size int, tcpmode_maxwin int, tcpmode_resend_time int, tcpmode_compress int, tcpmode_stat int,
 	timeout int, cryptoConfig *CryptoConfig, fecSender *FECSender, kcpTransport *KCPTransport, rateLimiter *RateLimiter) {
-	if diagIsDNS(target, data) {
-		loggo.Debug("DIAG DNS endpoint=%s stage=pingtunnel_send conn=%s target=%s %s selected=%s", diagEndpoint(sproto), connId, target, diagDNS(data), func() string {
-			if kcpTransport != nil {
-				return "kcp"
-			}
-			if fecSender != nil {
-				return "fec"
-			}
-			return "plain"
-		}())
-	}
-
 	m := &MyMsg{
 		Id:                  connId,
 		Type:                (int32)(msgType),
@@ -292,7 +280,7 @@ func recvICMP(workResultLock *sync.WaitGroup, exit *bool, conn icmp.PacketConn, 
 		// ourselves just sent as a Request, so this never affects real
 		// traffic (including real Echo Replies from the peer).
 		if bytes[0] == icmpEchoReplyType && isEchoReplyReflection(bytes[:n]) {
-			loggo.Debug("DIAG REFLECTION dropped inbound echo reply as self-reflection, id=%d seq=%d bytes=%d peer=%v",
+			loggo.Debug("dropped inbound echo reply as self-reflection, id=%d seq=%d bytes=%d peer=%v",
 				int(binary.BigEndian.Uint16(bytes[4:6])), int(binary.BigEndian.Uint16(bytes[6:8])), n, icmpSrcToIPAddr(srcaddr))
 			continue
 		}
@@ -391,10 +379,6 @@ func deliverPayload(mb []byte, cryptoConfig *CryptoConfig, recv chan<- *Packet, 
 		loggo.Debug("processPacket data invalid %s", my.Id)
 		return
 	}
-	if diagIsDNS(my.Target, my.Data) {
-		loggo.Debug("DIAG DNS endpoint=%s stage=pingtunnel_decoded conn=%s target=%s %s echo=%d peer=%v", diagDecodedEndpoint(my.Rproto), my.Id, my.Target, diagDNS(my.Data), echoId, src)
-	}
-
 	recv <- &Packet{my: my, src: src, echoId: echoId, echoSeq: echoSeq}
 }
 

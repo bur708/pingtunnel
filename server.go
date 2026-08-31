@@ -781,7 +781,7 @@ func (p *Server) Recv(conn *ServerConn, id string, src *net.IPAddr) {
 
 	bytes := make([]byte, 2000)
 	fecSender, kcpTransport := p.peerTransport(src, conn.echoId)
-	loggo.Debug("DIAG PEERTRANSPORT src=%v echoId=%d fecSender=%v kcpTransport=%v", src, conn.echoId, fecSender != nil, kcpTransport != nil)
+	loggo.Debug("peer transport resolved src=%v echoId=%d fec=%v kcp=%v", src, conn.echoId, fecSender != nil, kcpTransport != nil)
 
 	for !p.exit {
 

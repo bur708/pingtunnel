@@ -379,11 +379,11 @@ func (p *Client) Run() error {
 	// source instead of patching every consumer.
 	if icmpDatagram {
 		if udpAddr, ok := conn.LocalAddr().(*net.UDPAddr); ok && udpAddr.Port > 0 {
-			loggo.Info("DIAG CLIENTID Android ping-socket: overriding randomized id %d with actual kernel-assigned ident (bound port) %d", p.id, udpAddr.Port)
+			loggo.Info("ping-socket: overriding randomized echo id %d with kernel-assigned ident %d", p.id, udpAddr.Port)
 			p.id = udpAddr.Port
 		}
 	}
-	loggo.Info("DIAG CLIENTID this client's own effective ICMP echo id is %d", p.id)
+	loggo.Info("client effective ICMP echo id is %d", p.id)
 
 	if p.tcpmode > 0 {
 		tcplistenConn, err := net.ListenTCP("tcp", p.tcpaddr)
