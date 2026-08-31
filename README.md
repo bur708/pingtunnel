@@ -1,12 +1,10 @@
 # Pingtunnel
 
-[<img src="https://img.shields.io/github/license/esrrhs/pingtunnel">](https://github.com/esrrhs/pingtunnel)
-[<img src="https://img.shields.io/github/languages/top/esrrhs/pingtunnel">](https://github.com/esrrhs/pingtunnel)
-[![Go Report Card](https://goreportcard.com/badge/github.com/esrrhs/pingtunnel)](https://goreportcard.com/report/github.com/esrrhs/pingtunnel)
-[<img src="https://img.shields.io/github/v/release/esrrhs/pingtunnel">](https://github.com/esrrhs/pingtunnel/releases)
-[<img src="https://img.shields.io/github/downloads/esrrhs/pingtunnel/total">](https://github.com/esrrhs/pingtunnel/releases)
-[<img src="https://img.shields.io/docker/pulls/esrrhs/pingtunnel">](https://hub.docker.com/repository/docker/esrrhs/pingtunnel)
-[<img src="https://img.shields.io/github/actions/workflow/status/esrrhs/pingtunnel/go.yml?branch=master">](https://github.com/esrrhs/pingtunnel/actions)
+[<img src="https://img.shields.io/github/license/bur708/pingtunnel">](https://github.com/bur708/pingtunnel)
+[<img src="https://img.shields.io/github/languages/top/bur708/pingtunnel">](https://github.com/bur708/pingtunnel)
+[<img src="https://img.shields.io/github/v/release/bur708/pingtunnel">](https://github.com/bur708/pingtunnel/releases)
+[<img src="https://img.shields.io/github/downloads/bur708/pingtunnel/total">](https://github.com/bur708/pingtunnel/releases)
+[<img src="https://img.shields.io/github/actions/workflow/status/bur708/pingtunnel/go.yml?branch=master">](https://github.com/bur708/pingtunnel/actions)
 
 Pingtunnel is a tool that sends TCP/UDP traffic over ICMP.
 
@@ -32,7 +30,7 @@ Everything above is opt-in and off by default; with no new flags set, the wire b
 ### Install server
 
 -   First prepare a server with a public IP, such as EC2 on AWS, assuming the domain name or public IP is www.yourserver.com
--   Download the corresponding installation package from [releases](https://github.com/esrrhs/pingtunnel/releases), such as pingtunnel_linux64.zip, then decompress and execute with **root** privileges
+-   Download the corresponding installation package from [releases](https://github.com/bur708/pingtunnel/releases), such as pingtunnel_linux_amd64.zip, then decompress and execute with **root** privileges
 -   “-key” parameter is **int** type, only supports numbers between 0-2147483647
 
 ```
@@ -49,7 +47,7 @@ echo 1 > /proc/sys/net/ipv4/icmp_echo_ignore_all
 
 ### Install the client
 
--   Download the corresponding installation package from [releases](https://github.com/esrrhs/pingtunnel/releases), such as pingtunnel_windows64.zip, and decompress it
+-   Download the corresponding installation package from [releases](https://github.com/bur708/pingtunnel/releases), such as pingtunnel_windows_amd64.zip, and decompress it
 -   Then run with **administrator** privileges. The commands corresponding to different forwarding functions are as follows.
 -   If you see ping/pong logs, the connection is normal
 -   “-key” parameter is **int** type, only supports numbers between 0-2147483647
@@ -78,15 +76,16 @@ pingtunnel.exe -type client -l :4455 -s www.yourserver.com -t www.yourserver.com
 * [**pingtunnel-client**](https://github.com/bur708/pingtunnel-client) — a fork of the community Android client ([itismoej/pingtunnel-client](https://github.com/itismoej/pingtunnel-client)) updated to support this fork's encryption, FEC, and KCP reliability modes.
 
 ### Use Docker
-It can also be started directly with docker, which is more convenient. It uses the same parameters as above.
+A `Dockerfile` is included; build a local image to get this fork's features (`docker build -t pingtunnel .`), then run it with the same parameters as above, e.g.:
 -   server:
 ```
-docker run --name pingtunnel-server -d --privileged --network host --restart=always esrrhs/pingtunnel ./pingtunnel -type server -key 123456
+docker run --name pingtunnel-server -d --privileged --network host --restart=always pingtunnel ./pingtunnel -type server -key 123456
 ```
 -   client:
 ```
-docker run --name pingtunnel-client -d --restart=always -p 1080:1080 esrrhs/pingtunnel ./pingtunnel -type client -l :1080 -s www.yourserver.com -sock5 1 -key 123456
+docker run --name pingtunnel-client -d --restart=always -p 1080:1080 pingtunnel ./pingtunnel -type client -l :1080 -s www.yourserver.com -sock5 1 -key 123456
 ```
+(No prebuilt Docker Hub image is published for this fork - `esrrhs/pingtunnel` on Docker Hub is upstream's own image, without this fork's additions.)
 
 ## Thanks for free JetBrains Open Source license
 
