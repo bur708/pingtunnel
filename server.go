@@ -240,7 +240,14 @@ func (p *Server) Stop() {
 
 func (p *Server) processPacket(packet *Packet) {
 
-	if packet.my.Key != (int32)(p.key) {
+	// See client.go's processPacket for the full reasoning: the numeric
+	// -key check is redundant once -encrypt is active (AEAD already
+	// authenticates the packet, and KCP/FEC's own HMAC is derived from
+	// the encryption key, not this one), and is actively wrong for this
+	// project's own Android client, whose UI sends -key 0 whenever
+	// encryption is configured - a real encrypted client would otherwise
+	// have every request silently dropped right here.
+	if p.cryptoConfig == nil && packet.my.Key != (int32)(p.key) {
 		return
 	}
 

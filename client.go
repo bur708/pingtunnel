@@ -861,7 +861,22 @@ func (p *Client) processPacket(packet *Packet) {
 		return
 	}
 
-	if packet.my.Key != (int32)(p.key) {
+	// The numeric -key check only makes sense as an authentication check
+	// when there's nothing stronger backing it: with -encrypt active, the
+	// server's replies are AEAD-authenticated (a forged/tampered packet
+	// simply fails to decrypt in deliverPayload, well before this method
+	// ever sees it) and every KCP/FEC segment is HMAC-tagged using a key
+	// derived from the same encryption key (see deriveKCPMacKey/
+	// deriveFECMacKey) rather than the numeric one - so enforcing an
+	// exact numeric-key match here too is redundant at best. It's also
+	// actively wrong for this project's own Android client: its
+	// connection-settings UI treats "-key" and encryption as mutually
+	// exclusive and sends 0 for the former whenever the latter is set
+	// (main.dart's effectiveKey), so a real, correctly-configured
+	// encrypted client always fails this check against a server whose
+	// own -key is a real nonzero value - discovered live 2026-08-31
+	// testing AES-256 end to end: every reply was silently dropped here.
+	if p.cryptoConfig == nil && packet.my.Key != (int32)(p.key) {
 		return
 	}
 
