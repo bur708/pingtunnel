@@ -295,7 +295,6 @@ func main() {
 		NoPrint:   *noprint > 0,
 	})
 	loggo.Info("start...")
-	loggo.Info("key %d", *key)
 	if cryptoConfig == nil {
 		// Without -encrypt every MyMsg, including this numeric key, goes
 		// out as cleartext inside the ICMP payload - anyone who can
