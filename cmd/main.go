@@ -10,9 +10,16 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof"
+	"os"
 	"strconv"
 	"time"
 )
+
+// PINGTUNNEL_ENCRYPT_KEY overrides -encrypt-key when set. A flag's value is
+// visible to any local user via ps/proc/cmdline, and every process start/stop
+// gets echoed into systemd's journal verbatim - an environment variable
+// avoids both.
+const encryptKeyEnvVar = "PINGTUNNEL_ENCRYPT_KEY"
 
 var usage = `
     通过伪造ping，把tcp/udp/sock5流量通过远程服务器转发到目的服务器上。用于突破某些运营商封锁TCP/UDP流量。
@@ -91,7 +98,11 @@ Usage:
               Encryption mode: aes128, aes256, chacha20
 
     -encrypt-key 加密密钥，支持base64编码或密码短语
-              Encryption key, supports base64 encoded key or passphrase
+              Encryption key, supports base64 encoded key or passphrase.
+              Prefer setting the PINGTUNNEL_ENCRYPT_KEY environment
+              variable instead of this flag: a flag's value is visible to
+              any local user via ps/proc and gets echoed into systemd's
+              journal on every start/stop, an environment variable is not
 
     -fec      开启前向纠错(FEC)，用于在丢包链路（卫星、机场wifi等）上恢复丢失的数据包，默认关闭，客户端和服务器需要使用相同的fec参数
               Enable forward error correction (FEC) to recover lost packets on lossy links (satellite, airport wifi, etc). Default off. Client and server must use matching FEC parameters
@@ -168,7 +179,7 @@ func main() {
 	maxPPS := flag.Int("max-pps", pingtunnel.DefaultMaxPPS, "cap on total outbound ICMP packets/sec across every connection sharing this tunnel; a safety net against retransmission storms (e.g. many connections' FrameMgr resend timers firing at once under real loss) turning into a self-inflicted congestion collapse - lower it if your link is narrower than the default assumes")
 	key := flag.Int("key", 0, "key")
 	encryption := flag.String("encrypt", "", "encryption mode: aes128, aes256, chacha20")
-	encryptionKey := flag.String("encrypt-key", "", "encryption key (base64 or passphrase)")
+	encryptionKey := flag.String("encrypt-key", "", "encryption key (base64 or passphrase). Prefer the "+encryptKeyEnvVar+" environment variable instead: this flag's value is visible to any local user via ps/proc and gets echoed into systemd's journal on every start/stop")
 	fec := flag.Bool("fec", false, "enable forward error correction (FEC) to recover from packet loss on lossy links")
 	fecData := flag.Int("fec-data", 10, "FEC data shards per block (used only when -fec is set)")
 	fecParity := flag.Int("fec-parity", 3, "FEC parity shards per block, tolerates losing up to this many packets per block of fec-data+fec-parity (used only when -fec is set)")
@@ -231,7 +242,12 @@ func main() {
 		return
 	}
 
-	if encryptionMode != pingtunnel.NoEncryption && *encryptionKey == "" {
+	effectiveEncryptionKey := *encryptionKey
+	if envKey := os.Getenv(encryptKeyEnvVar); envKey != "" {
+		effectiveEncryptionKey = envKey
+	}
+
+	if encryptionMode != pingtunnel.NoEncryption && effectiveEncryptionKey == "" {
 		fmt.Println("Encryption key is required when encryption mode is specified")
 		return
 	}
@@ -239,7 +255,7 @@ func main() {
 	// Create crypto configuration
 	var cryptoConfig *pingtunnel.CryptoConfig
 	if encryptionMode != pingtunnel.NoEncryption {
-		cryptoConfig, err = pingtunnel.NewCryptoConfig(encryptionMode, *encryptionKey)
+		cryptoConfig, err = pingtunnel.NewCryptoConfig(encryptionMode, effectiveEncryptionKey)
 		if err != nil {
 			fmt.Printf("Failed to create crypto config: %v\n", err)
 			return
