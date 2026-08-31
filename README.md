@@ -14,6 +14,19 @@ Pingtunnel is a tool that sends TCP/UDP traffic over ICMP.
 
 ![image](network.jpg)
 
+## This fork
+
+This is a fork of [esrrhs/pingtunnel](https://github.com/esrrhs/pingtunnel) with a few additions on top of the original:
+
+- **Encryption** (`-encrypt aes128|aes256|chacha20` + `-encrypt-key <passphrase>`) — authenticated encryption (AEAD) for the tunneled traffic, independent of the legacy numeric `-key`. Pick `chacha20` on devices without AES hardware acceleration (cheaper in software); `aes128`/`aes256` are fine on anything with AES-NI or an equivalent.
+- **Reliability modes for lossy links** — `-fec`/`-fec-data`/`-fec-parity` (Reed-Solomon forward error correction: recovers from loss without retransmitting) and `-kcp` (a reliable ARQ layer instead of the default per-connection resend logic), mutually exclusive. Neither is required: the server auto-detects and matches whichever mode (or none) each connecting client is already using, per client, with no client-side configuration needed on the server's end.
+- **`-kcp-congestion`** — opt into KCP's own TCP-Reno-style congestion control (slow start / additive-increase-multiplicative-decrease) instead of sending at a fixed window regardless of observed loss. Worth trying on a shared or bandwidth-constrained link.
+- **`-kcp-sndwnd`/`-kcp-rcvwnd`** — tune KCP's send/receive window for high-bandwidth-delay-product links (e.g. a fast-but-high-latency satellite connection) where the default window can't keep enough data in flight.
+- **`-max-pps`** — a shared token-bucket cap on total outbound ICMP packets/sec, guarding against retransmission storms turning into a self-inflicted congestion collapse under real loss.
+- **`-connect-timeout`** — configurable handshake-ack timeout for new tcpmode connections (useful when many open at once over a slow/lossy link, e.g. behind a system-wide proxy client).
+
+Everything above is opt-in and off by default; with no new flags set, the wire behavior is unchanged from upstream.
+
 ## Usage
 
 ### Install server
@@ -62,11 +75,7 @@ pingtunnel.exe -type client -l :4455 -s www.yourserver.com -t www.yourserver.com
 
 ### Use Android Client
 
-A dedicated Android client for pingtunnel is now available, developed by the community.
-
-* [**pingtunnel-client**](https://github.com/itismoej/pingtunnel-client)
-
-> Big thanks to [itismoej](https://github.com/itismoej) for developing this Android client!
+* [**pingtunnel-client**](https://github.com/bur708/pingtunnel-client) — a fork of the community Android client ([itismoej/pingtunnel-client](https://github.com/itismoej/pingtunnel-client)) updated to support this fork's encryption, FEC, and KCP reliability modes.
 
 ### Use Docker
 It can also be started directly with docker, which is more convenient. It uses the same parameters as above.
